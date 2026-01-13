@@ -1,13 +1,10 @@
 Queueing jobs in Node.js using PostgreSQL like a boss.
 
-[![PostgreSql Version](https://img.shields.io/badge/PostgreSQL-11+-blue.svg?maxAge=2592000)](http://www.postgresql.org)
-[![npm version](https://badge.fury.io/js/pg-boss.svg)](https://badge.fury.io/js/pg-boss)
-![Build](https://github.com/timgit/pg-boss/actions/workflows/ci.yml/badge.svg?branch=master)
-[![Coverage Status](https://coveralls.io/repos/github/timgit/pg-boss/badge.svg?branch=master)](https://coveralls.io/github/timgit/pg-boss?branch=master)
+> **Note:** This is a fork of [pg-boss](https://github.com/timgit/pg-boss) by Tim Jones, forked from version 9.0.3 (July 2023). This fork is maintained independently by My Technology, Inc. and is not affiliated with the original project.
 
 ```js
 async function readme() {
-  const PgBoss = require('pg-boss');
+  const PgBoss = require('@MyTechnologiesOrg/pg-boss');
   const boss = new PgBoss('postgres://user:pass@host/database');
 
   boss.on('error', error => console.error(error));
@@ -55,12 +52,16 @@ This will likely cater the most to teams already familiar with the simplicity of
 
 ## Installation
 
-``` bash
-# npm
-npm install pg-boss
+First, configure npm to use GitHub Packages for the `@MyTechnologiesOrg` scope by adding to your `.npmrc`:
 
-# yarn
-yarn add pg-boss
+```
+@MyTechnologiesOrg:registry=https://npm.pkg.github.com
+```
+
+Then install:
+
+```bash
+npm install @MyTechnologiesOrg/pg-boss
 ```
 
 ## Documentation
@@ -71,9 +72,8 @@ yarn add pg-boss
 To setup a development environment for this library:
 
 ```bash
-git clone https://github.com/timgit/pg-boss.git
+git clone https://github.com/MyTechnologiesOrg/pg-boss.git
 npm install
-
 ```
 
 To run the test suite you will need to pgboss access to an empty postgres database. You can set one up using the following commands on a local postgres instance:
@@ -93,3 +93,5 @@ You can then run the linter and test suite using
 ```bash
 npm test
 ```
+
+
