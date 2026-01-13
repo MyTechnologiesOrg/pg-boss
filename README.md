@@ -1,7 +1,5 @@
 Queueing jobs in Node.js using PostgreSQL like a boss.
 
-> **Note:** This is a fork of [pg-boss](https://github.com/timgit/pg-boss) by Tim Jones, forked from version 9.0.3 (July 2023). This fork is maintained independently by My Technology, Inc. and is not affiliated with the original project.
-
 ```js
 async function readme() {
   const PgBoss = require('@MyTechnologiesOrg/pg-boss');
@@ -94,4 +92,6 @@ You can then run the linter and test suite using
 npm test
 ```
 
+## Attribution
 
+This is a fork of [pg-boss](https://github.com/timgit/pg-boss) by Tim Jones, forked from version 9.0.3 (July 2023). This fork is maintained independently by My Technology, Inc. and is not affiliated with the original project.
