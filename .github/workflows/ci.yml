@@ -5,13 +5,13 @@ on:
   pull_request:
     branches: [main]
 
-name: CI
+name: ci
 
 jobs:
   container-job:
     runs-on: ubuntu-latest
     container: node:24
-    services:      
+    services:
       postgres:
         image: postgres
         env:
@@ -21,7 +21,7 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-          
+
     steps:
     - name: Checkout code
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -33,11 +33,11 @@ jobs:
 
     - name: Install
       run: npm install
-      
+
     - name: Test
       run: npm run cover
       env:
         POSTGRES_HOST: postgres
-      
+
     - name: Coveralls
       uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b # v2.3.6
