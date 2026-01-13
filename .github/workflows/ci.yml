@@ -10,10 +10,7 @@ name: CI
 jobs:
   container-job:
     runs-on: ubuntu-latest
-    container: node:18
-    strategy:
-      matrix:
-        node: [ 16, 18 ]
+    container: node:24
     services:      
       postgres:
         image: postgres
@@ -27,12 +24,12 @@ jobs:
           
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
-    
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
     - name: Set up Node.js
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
-        node-version: ${{ matrix.node }}
+        node-version: 24
 
     - name: Install
       run: npm install
@@ -43,18 +40,4 @@ jobs:
         POSTGRES_HOST: postgres
       
     - name: Coveralls
-      uses: coverallsapp/github-action@v2
-      with:
-        flag-name: run-${{ join(matrix.*, '-') }}
-        parallel: true
-
-  finish:
-    needs: container-job
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    steps:
-    - name: Coveralls Finished
-      uses: coverallsapp/github-action@v2
-      with:
-        parallel-finished: true
-        carryforward: "run-1,run-2"
+      uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b # v2.3.6
