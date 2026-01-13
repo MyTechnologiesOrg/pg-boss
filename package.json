@@ -1,5 +1,5 @@
 {
-  "name": "@MyTechnologiesOrg/pg-boss",
+  "name": "@mytechnologiesorg/pg-boss",
   "version": "1.0.0",
   "description": "Queueing jobs in Node.js using PostgreSQL like a boss",
   "main": "./src/index.js",

@@ -2,7 +2,7 @@ Queueing jobs in Node.js using PostgreSQL like a boss.
 
 ```js
 async function readme() {
-  const PgBoss = require('@MyTechnologiesOrg/pg-boss');
+  const PgBoss = require('@mytechnologiesorg/pg-boss');
   const boss = new PgBoss('postgres://user:pass@host/database');
 
   boss.on('error', error => console.error(error));
@@ -53,13 +53,13 @@ This will likely cater the most to teams already familiar with the simplicity of
 First, configure npm to use GitHub Packages for the `@MyTechnologiesOrg` scope by adding to your `.npmrc`:
 
 ```
-@MyTechnologiesOrg:registry=https://npm.pkg.github.com
+@mytechnologiesorg:registry=https://npm.pkg.github.com
 ```
 
 Then install:
 
 ```bash
-npm install @MyTechnologiesOrg/pg-boss
+npm install @mytechnologiesorg/pg-boss
 ```
 
 ## Documentation
