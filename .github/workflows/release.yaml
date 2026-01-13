@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    concurrency:
+      group: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Calculate Semantic Version
+        id: version
+        uses: mytechnologiesorg/devops-actions/github/create-release/v1@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: true
+
+      - name: Update Package Version
+        run: npm version ${{ steps.version.outputs.new-version }} --no-git-tag-version
+
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        uses: mytechnologiesorg/devops-actions/github/create-release/v1@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
