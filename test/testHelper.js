@@ -65,7 +65,15 @@ async function getDb (database) {
 
 async function createPgCrypto (database) {
   const db = await getDb(database)
-  await db.executeSql('create extension if not exists pgcrypto')
+  try {
+    await db.executeSql('create extension if not exists pgcrypto')
+  } catch (err) {
+    // Ignore duplicate key errors that can occur when running tests in parallel
+    // Multiple processes may try to create the extension simultaneously
+    if (!err.message.includes('duplicate key value violates unique constraint')) {
+      throw err
+    }
+  }
   await db.close()
 }
 
