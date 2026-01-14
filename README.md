@@ -74,7 +74,31 @@ git clone https://github.com/MyTechnologiesOrg/pg-boss.git
 npm install
 ```
 
-To run the test suite you will need to pgboss access to an empty postgres database. You can set one up using the following commands on a local postgres instance:
+### Running Tests Locally
+
+```bash
+# run all tests
+make test
+
+# run tests with coverage (like ci)
+make ci
+
+# run a specific test file
+make test-run test/configTest.js
+```
+
+#### Other Make Commands
+
+```bash
+make install   # install dependencies
+make db-up     # start postgresql
+make db-down   # stop postgresql
+make clean     # stop postgresql and remove volumes
+```
+
+### Manual Database Setup
+
+Alternatively, you can run tests against your own PostgreSQL instance. You will need to give pg-boss access to an empty postgres database:
 
 ```sql
 CREATE DATABASE pgboss;
@@ -86,7 +110,7 @@ CREATE EXTENSION pgcrypto;
 
 If you use a different database name, username or password, or want to run the test suite against a database that is running on a remote machine then you will need to edit the `test/config.json` file with the appropriate connection values.
 
-You can then run the linter and test suite using
+You can then run the linter and test suite using:
 
 ```bash
 npm test
