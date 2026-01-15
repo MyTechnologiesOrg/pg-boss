@@ -9,7 +9,7 @@ describe('archive', function () {
     maintenanceIntervalSeconds: 1
   }
 
-  it('should archive a completed job', async function () {
+  it('should delete a completed job without archiving', async function () {
     const config = { ...this.test.bossConfig, ...defaults }
     const boss = this.test.boss = await helper.start(config)
     const queue = this.test.bossConfig.schema
@@ -19,14 +19,20 @@ describe('archive', function () {
 
     assert.strictEqual(job.id, jobId)
 
+    await delay(1000)
+
+    const insertedJob = await helper.getJobById(config.schema, job.id)
+    assert.strictEqual(insertedJob.id, jobId)
+
     await boss.complete(jobId)
 
     await delay(4000)
 
     const archivedJob = await helper.getArchivedJobById(config.schema, jobId)
+    assert.strictEqual(archivedJob, null)
 
-    assert.strictEqual(jobId, archivedJob.id)
-    assert.strictEqual(queue, archivedJob.name)
+    const deletedJob = await helper.getJobById(config.schema, job.id)
+    assert.strictEqual(deletedJob, null)
   })
 
   it('should retrieve an archived job via getJobById()', async function () {
@@ -39,7 +45,9 @@ describe('archive', function () {
 
     assert.strictEqual(job.id, jobId)
 
-    await boss.complete(jobId)
+    const failPayload = { someReason: 'nuna' }
+
+    await boss.fail(jobId, failPayload)
 
     await delay(4000)
 

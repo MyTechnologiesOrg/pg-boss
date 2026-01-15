@@ -71,10 +71,6 @@ describe('deleteQueue', function () {
 
     assert.strictEqual(job.id, jobId)
 
-    await boss.complete(jobId)
-
-    await delay(3000)
-
     const db = await helper.getDb()
 
     const getJobCount = async table => {
@@ -86,7 +82,17 @@ describe('deleteQueue', function () {
     const preArchiveCount = await getJobCount('archive')
 
     assert(preJobCount > 0)
-    assert(preArchiveCount > 0)
+    assert(preArchiveCount === 0)
+
+    await boss.complete(jobId)
+
+    await delay(3000)
+
+    const preClearCount = await getJobCount('job')
+    const preClearArchiveCount = await getJobCount('archive')
+
+    assert(preClearCount === (preJobCount - 1))
+    assert(preClearArchiveCount === 0)
 
     await boss.clearStorage()
 
