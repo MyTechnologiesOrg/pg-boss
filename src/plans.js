@@ -659,25 +659,42 @@ function purge (schema, interval) {
 
 function archive (schema, completedInterval, failedInterval = completedInterval) {
   return `
-    WITH archived_rows AS (
+    WITH deleted_job_rows AS (
       DELETE FROM ${schema}.job
-      WHERE (
-          state <> '${states.failed}' AND completedOn < (now() - interval '${completedInterval}')
-        )
-        OR (
-          state = '${states.failed}' AND completedOn < (now() - interval '${failedInterval}')
-        )
-        OR (
-          state < '${states.active}' AND keepUntil < now()
+      WHERE state = '${states.completed}'
+        AND completedOn < (now() - interval '${completedInterval}')
+      RETURNING 1
+    ),
+    archived_rows AS (
+      DELETE FROM ${schema}.job
+      WHERE state <> '${states.completed}'
+        AND (
+          (
+            state <> '${states.failed}'
+            AND completedOn < (now() - interval '${completedInterval}')
+          )
+          OR (
+            state = '${states.failed}'
+            AND completedOn < (now() - interval '${failedInterval}')
+          )
+          OR (
+            state < '${states.active}'
+            AND keepUntil < now()
+          )
         )
       RETURNING *
     )
     INSERT INTO ${schema}.archive (
-      id, name, priority, data, state, retryLimit, retryCount, retryDelay, retryBackoff, startAfter, startedOn, singletonKey, singletonOn, expireIn, createdOn, completedOn, keepUntil, on_complete, output
+      id, name, priority, data, state, retryLimit, retryCount, retryDelay, retryBackoff,
+      startAfter, startedOn, singletonKey, singletonOn, expireIn, createdOn, completedOn,
+      keepUntil, on_complete, output
     )
     SELECT
-      id, name, priority, data, state, retryLimit, retryCount, retryDelay, retryBackoff, startAfter, startedOn, singletonKey, singletonOn, expireIn, createdOn, completedOn, keepUntil, on_complete, output
+      id, name, priority, data, state, retryLimit, retryCount, retryDelay, retryBackoff,
+      startAfter, startedOn, singletonKey, singletonOn, expireIn, createdOn, completedOn,
+      keepUntil, on_complete, output
     FROM archived_rows
+    RETURNING *;
   `
 }
 

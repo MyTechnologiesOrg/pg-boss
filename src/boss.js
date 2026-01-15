@@ -126,16 +126,48 @@ class Boss extends EventEmitter {
       if (this.config.__test__throw_maint) {
         throw new Error(this.config.__test__throw_maint)
       }
+    } catch (err) {
+      this.emit(events.error, err)
+      return
+    }
 
-      const started = Date.now()
+    const started = Date.now()
 
+    let errorFound = false
+
+    try {
       await this.expire()
+    } catch (err) {
+      this.emit(events.error, 'Custom Boss Expire Error')
+      this.emit(events.error, err)
+      errorFound = true
+    }
+
+    try {
       await this.archive()
+    } catch (err) {
+      this.emit(events.error, 'Custom Boss Archive Error')
+      this.emit(events.error, err)
+      errorFound = true
+    }
+
+    try {
       await this.purge()
+    } catch (err) {
+      this.emit(events.error, 'Custom Boss Purge Error')
+      this.emit(events.error, err)
+      errorFound = true
+    }
 
-      const ended = Date.now()
+    const ended = Date.now()
 
-      await this.setMaintenanceTime()
+    try {
+      if (!errorFound) {
+        await this.setMaintenanceTime()
+        this.emit(events.maintenance, 'Custom Boss Maintenance complete')
+      } else {
+        this.emit(events.error, 'Custom Boss Maintenance error, not saving that we completed maintenance window')
+      }
 
       this.emit('maintenance', { ms: ended - started })
 
