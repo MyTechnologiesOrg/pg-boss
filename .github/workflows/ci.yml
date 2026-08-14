@@ -35,7 +35,7 @@ jobs:
       run: npm install
 
     - name: Test
-      run: npm run cover -- --exit
+      run: npm run cover
       env:
         POSTGRES_HOST: postgres
         POSTGRES_PORT: 5432
