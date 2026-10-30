@@ -165,5 +165,18 @@ describe('fetch', function () {
       assert(retryFetch2)
       assert(retryFetch2.id === publish2)
     })
+
+    it('when enforceSingletonQueueActiveLimit=true, should match queue names containing quotes and dollar signs literally', async function () {
+      const boss = this.test.boss = await helper.start(this.test.bossConfig)
+      const queues = ['it\'s a queue', 'queue$2', '$queue$']
+
+      for (const queue of queues) {
+        const id = await boss.send(queue)
+        const job = await boss.fetch(queue, undefined, { enforceSingletonQueueActiveLimit: true })
+        assert(job, `no job fetched for ${queue}`)
+        assert.strictEqual(job.id, id)
+        assert.strictEqual(job.name, queue)
+      }
+    })
   })
 })

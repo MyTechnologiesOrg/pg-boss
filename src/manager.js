@@ -6,7 +6,6 @@ const debounce = require('lodash.debounce')
 const { serializeError: stringify } = require('serialize-error')
 const Attorney = require('./attorney')
 const Worker = require('./worker')
-const Db = require('./db')
 const pMap = require('p-map')
 
 const { QUEUES: BOSS_QUEUES } = require('./boss')
@@ -480,19 +479,9 @@ class Manager extends EventEmitter {
     const statementValues = [values.name, batchSize || 1]
 
     let result
-    if (options.enforceSingletonQueueActiveLimit && !options.db) {
-      // Prepare/format now and send multi-statement transaction
-      const fetchQuery = preparedStatement
-        .replace('$1', Db.quotePostgresStr(statementValues[0]))
-        .replace('$2', statementValues[1].toString())
-      // eslint-disable-next-line no-unused-vars
-      const [_begin, _setLocal, fetchResult, _commit] = await db.executeSql([
-        'BEGIN',
-        'SET LOCAL jit = OFF', // JIT can slow things down significantly
-        fetchQuery,
-        'COMMIT'
-      ].join(';\n'))
-      result = fetchResult
+    if (options.enforceSingletonQueueActiveLimit && !options.db && typeof db.executeSqlInTransaction === 'function') {
+      // JIT can slow things down significantly
+      result = await db.executeSqlInTransaction(preparedStatement, statementValues, ['SET LOCAL jit = OFF'])
     } else {
       result = await db.executeSql(preparedStatement, statementValues)
     }
