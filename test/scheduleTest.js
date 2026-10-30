@@ -27,6 +27,43 @@ describe('schedule', function () {
     assert(job)
   })
 
+  it('should reject a cron expression that can never match', async function () {
+    const boss = this.test.boss = await helper.start(this.test.bossConfig)
+
+    const queue = this.test.bossConfig.schema
+
+    await assert.rejects(boss.schedule(queue, '0 0 31 4,6 *'))
+
+    const schedules = await boss.getSchedules()
+
+    assert.strictEqual(schedules.length, 0)
+  })
+
+  it('should still send other schedules when one cannot be evaluated', async function () {
+    const config = {
+      ...this.test.bossConfig,
+      cronWorkerIntervalSeconds: 1
+    }
+
+    const boss = this.test.boss = await helper.start(config)
+
+    const errors = []
+    boss.on('error', error => errors.push(error.message))
+
+    const queue = this.test.bossConfig.schema
+    const badSchedule = `${queue}_unmatched`
+
+    await boss.db.executeSql(`INSERT INTO ${config.schema}.schedule (name, cron, timezone) VALUES ($1, $2, $3)`, [badSchedule, '0 0 31 4,6 *', 'UTC'])
+    await boss.schedule(queue, '* * * * *')
+
+    await delay(ASSERT_DELAY)
+
+    const job = await boss.fetch(queue)
+
+    assert(job)
+    assert(errors.some(message => message.includes(`Schedule: ${badSchedule}`)))
+  })
+
   it('should accept a custom clock monitoring interval in seconds', async function () {
     const config = {
       ...this.test.bossConfig,
