@@ -25,6 +25,25 @@ const events = {
   wip: 'wip'
 }
 
+const MAX_ERROR_CAUSE_DEPTH = 3
+
+// Other own properties and toJSON() output of errors (e.g. HTTP client request config) can carry credentials
+const pickErrorFields = (error, depth = 0) => {
+  const { name, message, stack, code, cause } = error
+
+  const result = { name, message, stack }
+
+  if (typeof code === 'string' || typeof code === 'number') {
+    result.code = code
+  }
+
+  if (cause instanceof Error && depth < MAX_ERROR_CAUSE_DEPTH) {
+    result.cause = pickErrorFields(cause, depth + 1)
+  }
+
+  return result
+}
+
 const resolveWithinSeconds = async (promise, seconds) => {
   const timeout = Math.max(1, seconds) * 1000
   const reject = delay.reject(timeout, { value: new Error(`handler execution exceeded ${timeout}ms`) })
@@ -523,9 +542,11 @@ class Manager extends EventEmitter {
   mapCompletionDataArg (data) {
     if (data === null || typeof data === 'undefined' || typeof data === 'function') { return null }
 
-    const result = (typeof data === 'object' && !Array.isArray(data))
-      ? data
-      : { value: data }
+    const result = (data instanceof Error)
+      ? pickErrorFields(data)
+      : (typeof data === 'object' && !Array.isArray(data))
+          ? data
+          : { value: data }
 
     return stringify(result)
   }
