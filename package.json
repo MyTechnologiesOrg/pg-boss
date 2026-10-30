@@ -80,8 +80,5 @@
     "url": "https://github.com/MyTechnologiesOrg/pg-boss/issues"
   },
   "homepage": "https://github.com/MyTechnologiesOrg/pg-boss#readme",
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
-  },
   "types": "./types.d.ts"
 }
