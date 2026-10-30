@@ -995,6 +995,8 @@ Schedules a job to be sent to the specified queue based on a cron expression. If
 
 `options` supports all properties in `send()` and an optional `tz` property that specifies a time zone name. If not specified, the default is UTC.
 
+`schedule()` throws if the cron expression is invalid, including expressions that parse but can never match a date. If a stored schedule can't be evaluated, it's skipped and an `error` event is emitted, and the remaining schedules are still sent.
+
 For example, the following code will send a job at 3:00am in the US central time zone into the queue `notification-abc`.
 
 ```js

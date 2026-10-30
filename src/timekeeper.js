@@ -151,7 +151,15 @@ class Timekeeper extends EventEmitter {
 
       const items = await this.getSchedules()
 
-      const sending = items.filter(i => this.shouldSendIt(i.cron, i.timezone))
+      const sending = items.filter(i => {
+        try {
+          return this.shouldSendIt(i.cron, i.timezone)
+        } catch (err) {
+          err.message = `${err.message} (Schedule: ${i.name})`
+          this.emit(this.events.error, err)
+          return false
+        }
+      })
 
       if (sending.length && !this.stopped) {
         await pMap(sending, it => this.send(it), { concurrency: 5 })
@@ -207,7 +215,8 @@ class Timekeeper extends EventEmitter {
   async schedule (name, cron, data, options = {}) {
     const { tz = 'UTC' } = options
 
-    cronParser.parseExpression(cron, { tz })
+    // prev() also rejects expressions that parse but can never match
+    cronParser.parseExpression(cron, { tz }).prev()
 
     // validation pre-check
     Attorney.checkSendArgs([name, data, options], this.config)
