@@ -13,7 +13,7 @@ const states = {
 const DEFAULT_SCHEMA = 'pgboss'
 const COMPLETION_JOB_PREFIX = `__state__${states.completed}__`
 const SINGLETON_QUEUE_KEY = '__pgboss__singleton_queue'
-const SINGLETON_QUEUE_KEY_ESCAPED = SINGLETON_QUEUE_KEY.replace(/_/g, '\\_')
+const SINGLETON_QUEUE_KEY_ESCAPED = SINGLETON_QUEUE_KEY.replace(/[\\%_]/g, '\\$&')
 
 const MIGRATE_RACE_MESSAGE = 'division by zero'
 const CREATE_RACE_MESSAGE = 'already exists'

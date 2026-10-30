@@ -96,12 +96,11 @@ describe('failure', function () {
     assert.strictEqual(job.data.response.someReason, failPayload.someReason)
   })
 
-  it('should preserve nested objects within a payload that is an instance of Error', async function () {
+  it('should preserve nested objects within a plain object payload', async function () {
     const boss = this.test.boss = await helper.start(this.test.bossConfig)
     const queue = this.test.bossConfig.schema
 
-    const failPayload = new Error('Something went wrong')
-    failPayload.some = { deeply: { nested: { reason: 'nuna' } } }
+    const failPayload = { message: 'Something went wrong', some: { deeply: { nested: { reason: 'nuna' } } } }
 
     const jobId = await boss.send(queue, null, { onComplete: true })
 
@@ -111,6 +110,39 @@ describe('failure', function () {
 
     assert.strictEqual(job.data.state, 'failed')
     assert.strictEqual(job.data.response.some.deeply.nested.reason, failPayload.some.deeply.nested.reason)
+  })
+
+  it('should only store name, message, stack, code and cause of an Error payload', async function () {
+    const boss = this.test.boss = await helper.start(this.test.bossConfig)
+    const queue = this.test.bossConfig.schema
+
+    const cause = new Error('connection refused')
+    cause.config = { headers: { Authorization: 'Bearer cause-secret' } }
+
+    const failPayload = new Error('request failed', { cause })
+    failPayload.code = 'ERR_BAD_RESPONSE'
+    failPayload.config = { headers: { Authorization: 'Bearer secret' } }
+    failPayload.toJSON = () => ({ message: 'request failed', config: failPayload.config })
+
+    const jobId = await boss.send(queue, null, { onComplete: true })
+
+    await boss.fail(jobId, failPayload)
+
+    const job = await boss.fetchCompleted(queue)
+    const { response } = job.data
+
+    assert.strictEqual(job.data.state, 'failed')
+    assert.deepStrictEqual(Object.keys(response).sort(), ['cause', 'code', 'message', 'name', 'stack'])
+    assert.strictEqual(response.name, 'Error')
+    assert.strictEqual(response.message, failPayload.message)
+    assert.strictEqual(response.code, failPayload.code)
+    assert(response.stack.includes(failPayload.message))
+    assert.strictEqual(response.cause.message, cause.message)
+    assert.strictEqual(response.cause.config, undefined)
+    assert(!JSON.stringify(response).includes('secret'))
+
+    const failedJob = await boss.getJobById(jobId)
+    assert(!JSON.stringify(failedJob.output).includes('secret'))
   })
 
   it('failure via Promise reject() should pass string wrapped in value prop', async function () {
@@ -134,8 +166,7 @@ describe('failure', function () {
     const queue = this.test.bossConfig.schema
     const something = 'clever'
 
-    const errorResponse = new Error('custom error')
-    errorResponse.something = something
+    const errorResponse = { message: 'custom error', something }
 
     await boss.work(queue, job => Promise.reject(errorResponse))
     await boss.send(queue, null, { onComplete: true })

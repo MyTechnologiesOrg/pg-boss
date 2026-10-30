@@ -1,6 +1,6 @@
 const assert = require('assert')
 const PgBoss = require('../')
-const Db = require('../src/db')
+const helper = require('./testHelper')
 
 describe('database', function () {
   it('should fail on invalid database host', async function () {
@@ -27,19 +27,34 @@ describe('database', function () {
     assert(response.text === query)
   })
 
-  describe('Db.quotePostgresStr', function () {
-    it('should dollar-sign quote specified input', async function () {
-      const str = Db.quotePostgresStr('Here\'s my input')
-      assert(str === '$sanitize$Here\'s my input$sanitize$')
+  describe('executeSqlInTransaction', function () {
+    it('should apply setup statements to the query transaction only', async function () {
+      const db = await helper.getDb()
+
+      try {
+        const { rows: [before] } = await db.executeSql('SELECT current_setting($1) as jit', ['jit'])
+        const { rows: [inside] } = await db.executeSqlInTransaction('SELECT current_setting($1) as jit', ['jit'], ['SET LOCAL jit = OFF'])
+        const { rows: [after] } = await db.executeSql('SELECT current_setting($1) as jit', ['jit'])
+
+        assert.strictEqual(inside.jit, 'off')
+        assert.strictEqual(after.jit, before.jit)
+      } finally {
+        await db.close()
+      }
     })
 
-    it('should error if input contains reserved quote delimiter', async function () {
-      const badInput = '$sanitize$; DROP TABLE job --'
+    it('should rethrow and release the client when the query fails', async function () {
+      const db = await helper.getDb()
+
       try {
-        Db.quotePostgresStr(badInput)
+        await db.executeSqlInTransaction('SELECT 1/0', [])
         assert(false, 'Error was expected but did not occur')
       } catch (err) {
-        assert(err.message === `Attempted to quote string that contains reserved Postgres delimeter: ${badInput}`)
+        assert(err.message.includes('division by zero'))
+        assert.strictEqual(db.pool.totalCount, 1)
+        assert.strictEqual(db.pool.idleCount, 1)
+      } finally {
+        await db.close()
       }
     })
   })

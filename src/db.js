@@ -29,12 +29,36 @@ class Db extends EventEmitter {
     }
   }
 
-  static quotePostgresStr (str) {
-    const delimeter = '$sanitize$'
-    if (str.includes(delimeter)) {
-      throw new Error(`Attempted to quote string that contains reserved Postgres delimeter: ${str}`)
+  async executeSqlInTransaction (text, values, setup = []) {
+    if (this.opened) {
+      const client = await this.pool.connect()
+      let releaseError
+
+      try {
+        await client.query('BEGIN')
+
+        for (const statement of setup) {
+          await client.query(statement)
+        }
+
+        const result = await client.query(text, values)
+
+        await client.query('COMMIT')
+
+        return result
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK')
+        } catch (rollbackErr) {
+          // a client that can't roll back is discarded rather than returned to the pool
+          releaseError = rollbackErr
+        }
+
+        throw err
+      } finally {
+        client.release(releaseError)
+      }
     }
-    return `${delimeter}${str}${delimeter}`
   }
 }
 
