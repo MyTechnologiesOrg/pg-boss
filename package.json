@@ -35,6 +35,11 @@
     "readme": "node ./test/readme.js"
   },
   "mocha": {
+    "ignore": [
+      "test/hooks.js",
+      "test/readme.js",
+      "test/testHelper.js"
+    ],
     "timeout": 10000,
     "slow": 10000,
     "bail": true,
