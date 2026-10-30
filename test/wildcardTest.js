@@ -40,4 +40,29 @@ describe('wildcard', function () {
 
     assert.strictEqual(job2, null)
   })
+
+  it('fetch() should match backslashes in queue names literally', async function () {
+    const boss = this.test.boss = await helper.start(this.test.bossConfig)
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(`${queue}x`)
+    const id = await boss.send(`${queue}\\x`)
+
+    const job = await boss.fetch(`${queue}\\x`)
+
+    assert(job)
+    assert.strictEqual(job.id, id)
+    assert.strictEqual(await boss.fetch(`${queue}\\`), null)
+  })
+
+  it('fetch() should not treat a backslash as escaping a wildcard', async function () {
+    const boss = this.test.boss = await helper.start(this.test.bossConfig)
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(`${queue}\\1234`)
+
+    assert.strictEqual(await boss.fetch(`${queue}\\%`), null)
+    assert.strictEqual(await boss.fetch(`${queue}\\_234`), null)
+    assert(await boss.fetch(`${queue}\\*`))
+  })
 })

@@ -147,7 +147,7 @@ function checkFetchArgs (name, batchSize, options) {
 }
 
 function sanitizeQueueNameForFetch (name) {
-  return name.replace(/[%_*]/g, match => match === '*' ? '%' : '\\' + match)
+  return name.replace(/[\\%_*]/g, match => match === '*' ? '%' : '\\' + match)
 }
 
 function getConfig (value) {
