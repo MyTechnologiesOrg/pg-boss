@@ -28,7 +28,7 @@ jobs:
 
       - name: Calculate Semantic Version
         id: version
-        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2.0
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v6.2.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           release_branches: main
@@ -44,7 +44,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release Tag
-        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2.0
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v6.2.0
         id: tag_version
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
