@@ -16,35 +16,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup NodeJS
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           registry-url: https://npm.pkg.github.com
 
       - name: Calculate Semantic Version
         id: version
-        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2.0
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7.0.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           release_branches: main
           default_bump: minor
           dry_run: true
 
+      # v7 leaves new_version empty when there are no releasable commits (e.g. a re-run)
       - name: Update Package Version
-        run: npm version ${{ steps.version.outputs.new_version }} --no-git-tag-version
+        if: steps.version.outputs.new_version != ''
+        run: npm version "$NEW_VERSION" --no-git-tag-version
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
 
       - name: Publish to GitHub Packages
+        if: steps.version.outputs.new_version != ''
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release Tag
-        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2.0
+        if: steps.version.outputs.new_version != ''
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7.0.0
         id: tag_version
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -52,6 +58,7 @@ jobs:
           default_bump: minor
 
       - name: Create Release
+        if: steps.tag_version.outputs.new_tag != ''
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           tag: ${{ steps.tag_version.outputs.new_tag }}
