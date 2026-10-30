@@ -45,22 +45,18 @@ This will likely cater the most to teams already familiar with the simplicity of
 * Automatic maintenance operations to manage table growth
 
 ## Requirements
-* Node 16 or higher
+* Node 24 or higher
 * PostgreSQL 11 or higher
 
 ## Installation
 
-First, configure npm to use GitHub Packages for the `@MyTechnologiesOrg` scope by adding to your `.npmrc`:
-
-```
-@mytechnologiesorg:registry=https://npm.pkg.github.com
-```
-
-Then install:
+This fork is installed from its git release tags rather than a package registry:
 
 ```bash
-npm install @mytechnologiesorg/pg-boss
+npm install @mytechnologiesorg/pg-boss@github:MyTechnologiesOrg/pg-boss#semver:^1
 ```
+
+Versions before 1.0.0 were also published to GitHub Packages. Version 1.0.0 and later are only available from git tags.
 
 ## Documentation
 * [Docs](docs/readme.md)
@@ -115,6 +111,12 @@ You can then run the linter and test suite using:
 ```bash
 npm test
 ```
+
+### Releases
+
+Every push to `main` creates a release, and the tag points at a commit that sets `package.json` to the released version on top of `main`. The version is calculated from [Conventional Commits](https://www.conventionalcommits.org/) since the previous tag: a breaking change (`feat!:`, `fix!:`, or a `BREAKING CHANGE:` footer in the commit body) makes a major release, `feat:` a minor, `fix:` a patch, and anything else a minor.
+
+Consumers that install with a `#semver:` range pick up every minor and patch release automatically, so mark any change that can break them as breaking.
 
 ## Attribution
 

@@ -6,14 +6,17 @@ on:
       - main
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   release:
+    name: Release
+    runs-on: ubuntu-latest
     concurrency:
       group: release
-    runs-on: ubuntu-latest
+      cancel-in-progress: false
+    permissions:
+      contents: write
     steps:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,7 +27,6 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          registry-url: https://npm.pkg.github.com
 
       - name: Calculate Semantic Version
         id: version
@@ -35,33 +37,27 @@ jobs:
           default_bump: minor
           dry_run: true
 
-      # v7 leaves new_version empty when there are no releasable commits (e.g. a re-run)
-      - name: Update Package Version
-        if: steps.version.outputs.new_version != ''
-        run: npm version "$NEW_VERSION" --no-git-tag-version
-        env:
-          NEW_VERSION: ${{ steps.version.outputs.new_version }}
-
-      - name: Publish to GitHub Packages
-        if: steps.version.outputs.new_version != ''
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+      # Consumers install from git tags (`github:MyTechnologiesOrg/pg-boss#semver:^1`),
+      # so the tag points at a commit that sets the released version on top of main.
       - name: Create Release Tag
-        if: steps.version.outputs.new_version != ''
-        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7.0.0
-        id: tag_version
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          release_branches: main
-          default_bump: minor
+        if: steps.version.outputs.new_tag != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+        run: |
+          npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version
+          git add package.json package-lock.json
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --allow-empty --message "chore(release): $NEW_TAG"
+          git tag "$NEW_TAG"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW_TAG"
 
       - name: Create Release
-        if: steps.tag_version.outputs.new_tag != ''
-        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
-        with:
-          tag: ${{ steps.tag_version.outputs.new_tag }}
-          name: ${{ steps.tag_version.outputs.new_tag }}
-          body: ${{ steps.tag_version.outputs.changelog }}
-          draft: false
+        if: steps.version.outputs.new_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+          CHANGELOG: ${{ steps.version.outputs.changelog }}
+        run: gh release create "$NEW_TAG" --repo "$GITHUB_REPOSITORY" --title "$NEW_TAG" --notes "$CHANGELOG" --verify-tag
