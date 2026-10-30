@@ -849,7 +849,7 @@ How often workers will poll the queue table for jobs. Available in the construct
 
 **Handler function**
 
-`handler` should either be an `async` function or return a promise. If an error occurs in the handler, it will be caught and stored into an output storage column in addition to marking the job as failed.
+`handler` should either be an `async` function or return a promise. If an error occurs in the handler, it will be caught and stored into an output storage column in addition to marking the job as failed. Only the `name`, `message`, `stack`, `code` and `cause` (recursively, with the same fields) of an `Error` are stored. Other properties are dropped, since errors from libraries such as HTTP clients often carry request configuration including credentials. To store additional failure details, reject with a plain object instead of an `Error`.
 
 Enforcing promise-returning handlers that are awaited in the workers defers polling for new jobs until the existing jobs are completed, providing backpressure.
 
@@ -1047,7 +1047,7 @@ The promise will resolve on a successful completion, or reject if not all of the
 
 ## `fail(id [, data, options])`
 
-Marks an active job as failed.  This would likely only be used with `fetch()`. Accepts an optional `data` argument for usage with [`onFail()`](#onfailname--options-handler) state-based workers or `fetchFailed()`.
+Marks an active job as failed.  This would likely only be used with `fetch()`. Accepts an optional `data` argument for usage with [`onFail()`](#onfailname--options-handler) state-based workers or `fetchFailed()`. If `data` is an `Error`, only its `name`, `message`, `stack`, `code` and `cause` are stored.
 
 The promise will resolve on a successful assignment of failure, or reject if the job could not be marked as failed.
 
