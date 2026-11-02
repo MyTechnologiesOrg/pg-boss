@@ -574,6 +574,8 @@ Available in constructor as a default, or overridden in send.
 
     >By default, there is no limit on the number of these jobs that may be active. However, this behavior may be modified by passing the [enforceSingletonQueueActiveLimit](#fetch) option.
 
+    >If an active job fails or expires while another job with the same key is already queued, or while another job with the same key retries in the same `fail()` call or expiry pass, it does not retry. It ends `failed` or `expired` with retries left, and the other job serves as its retry.
+
   ```js
   boss.send('my-job', {}, {singletonKey: '123', useSingletonQueue: true}) // resolves a jobId
   boss.send('my-job', {}, {singletonKey: '123', useSingletonQueue: true}) // resolves a null jobId until first job becomes active

@@ -448,21 +448,55 @@ function completeJobs (schema) {
   `
 }
 
+// Retrying would break job_singleton_queue when a same-key sibling is queued or retries in this
+// statement, so the job goes terminal instead. The LIKE on queued lets it use that index.
+function retryCandidates (schema, where) {
+  return `candidates AS (
+      SELECT j.id,
+        j.retryCount < j.retryLimit
+          AND j.singletonOn IS NULL
+          AND j.singletonKey LIKE '${SINGLETON_QUEUE_KEY_ESCAPED}%'
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM ${schema}.job queued
+              WHERE queued.name = j.name
+                AND queued.singletonKey = j.singletonKey
+                AND queued.singletonKey LIKE '${SINGLETON_QUEUE_KEY_ESCAPED}%'
+                AND queued.singletonOn IS NULL
+                AND queued.state < '${states.active}'
+                AND queued.id <> j.id
+            )
+            OR row_number() OVER (
+              PARTITION BY j.name, j.singletonKey, j.retryCount < j.retryLimit AND j.singletonOn IS NULL
+              ORDER BY j.state < '${states.active}' DESC, j.createdOn DESC, j.id
+            ) > 1
+          ) AS retry_collides
+      FROM ${schema}.job j
+      WHERE ${where}
+    )`
+}
+
 function failJobs (schema) {
+  const where = `id IN (SELECT UNNEST($1::uuid[]))
+        AND state < '${states.completed}'`
+
   return `
-    WITH results AS (
-      UPDATE ${schema}.job
+    WITH ${retryCandidates(schema, where)}, results AS (
+      UPDATE ${schema}.job j
       SET state = CASE
+          WHEN c.retry_collides THEN '${states.failed}'::${schema}.job_state
           WHEN retryCount < retryLimit
           THEN '${states.retry}'::${schema}.job_state
           ELSE '${states.failed}'::${schema}.job_state
           END,
-        completedOn = ${retryCompletedOnCase},
-        startAfter = ${retryStartAfterCase},
+        completedOn = CASE WHEN c.retry_collides THEN now() ELSE ${retryCompletedOnCase} END,
+        startAfter = CASE WHEN c.retry_collides THEN j.startAfter ELSE ${retryStartAfterCase} END,
         output = $2::jsonb
-      WHERE id IN (SELECT UNNEST($1::uuid[]))
-        AND state < '${states.completed}'
-      RETURNING *
+      FROM candidates c
+      WHERE j.id = c.id
+        AND j.state < '${states.completed}'
+      RETURNING j.*
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)
       SELECT
@@ -479,18 +513,23 @@ function failJobs (schema) {
 }
 
 function expire (schema) {
+  const where = `state = '${states.active}'
+        AND (startedOn + expireIn) < now()`
+
   return `
-    WITH results AS (
-      UPDATE ${schema}.job
+    WITH ${retryCandidates(schema, where)}, results AS (
+      UPDATE ${schema}.job j
       SET state = CASE
+          WHEN c.retry_collides THEN '${states.expired}'::${schema}.job_state
           WHEN retryCount < retryLimit THEN '${states.retry}'::${schema}.job_state
           ELSE '${states.expired}'::${schema}.job_state
           END,
-        completedOn = ${retryCompletedOnCase},
-        startAfter = ${retryStartAfterCase}
-      WHERE state = '${states.active}'
-        AND (startedOn + expireIn) < now()
-      RETURNING *
+        completedOn = CASE WHEN c.retry_collides THEN now() ELSE ${retryCompletedOnCase} END,
+        startAfter = CASE WHEN c.retry_collides THEN j.startAfter ELSE ${retryStartAfterCase} END
+      FROM candidates c
+      WHERE j.id = c.id
+        AND j.state = '${states.active}'
+      RETURNING j.*
     )
     INSERT INTO ${schema}.job (name, data, keepUntil)
     SELECT
