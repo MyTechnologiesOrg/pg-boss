@@ -529,6 +529,7 @@ function expire (schema) {
       FROM candidates c
       WHERE j.id = c.id
         AND j.state = '${states.active}'
+        AND (j.startedOn + j.expireIn) < now()
       RETURNING j.*
     )
     INSERT INTO ${schema}.job (name, data, keepUntil)

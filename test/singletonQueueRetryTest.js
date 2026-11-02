@@ -1,5 +1,6 @@
 const assert = require('assert')
 const helper = require('./testHelper')
+const pg = require('pg')
 
 describe('singleton queue retry collisions', function () {
   const queueOptions = { singletonKey: 'myKey', useSingletonQueue: true, retryLimit: 2 }
@@ -237,5 +238,32 @@ describe('singleton queue retry collisions', function () {
 
     assert.strictEqual((await getState(schema, keyedId)).state, 'retry')
     assert.strictEqual((await getState(schema, throttledId)).state, 'retry')
+  })
+
+  it('expire() rechecks the deadline of a job restarted while it waited for the row lock', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-expire-relocked'
+
+    const jobId = await boss.send(queue, null, { retryLimit: 2 })
+    await boss.fetch(queue)
+    await makeOverdue(schema, [jobId])
+
+    const client = new pg.Client({ connectionString: helper.getConnectionString() })
+    await client.connect()
+
+    try {
+      await client.query('BEGIN')
+      await client.query(`UPDATE ${schema}.job SET startedOn = now() WHERE id = $1`, [jobId])
+
+      const expiring = boss.expire()
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      await client.query('COMMIT')
+      await expiring
+    } finally {
+      await client.end()
+    }
+
+    assert.strictEqual((await getState(schema, jobId)).state, 'active')
   })
 })
