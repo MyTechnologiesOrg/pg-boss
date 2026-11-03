@@ -135,18 +135,19 @@ class Boss extends EventEmitter {
 
     let errorFound = false
 
+    // archive first so a queued singleton-queue job past keepUntil is gone before expire() checks for it
     try {
-      await this.expire()
+      await this.archive()
     } catch (err) {
-      this.emit(events.error, 'Custom Boss Expire Error')
+      this.emit(events.error, 'Custom Boss Archive Error')
       this.emit(events.error, err)
       errorFound = true
     }
 
     try {
-      await this.archive()
+      await this.expire()
     } catch (err) {
-      this.emit(events.error, 'Custom Boss Archive Error')
+      this.emit(events.error, 'Custom Boss Expire Error')
       this.emit(events.error, err)
       errorFound = true
     }
@@ -245,7 +246,16 @@ class Boss extends EventEmitter {
   }
 
   async expire () {
-    await this.executeSql(this.expireCommand)
+    try {
+      await this.executeSql(this.expireCommand)
+    } catch (err) {
+      // a same-key job queued after this statement's snapshot collides once; a fresh snapshot sees it
+      if (err.code !== '23505' || err.constraint !== 'job_singleton_queue') {
+        throw err
+      }
+
+      await this.executeSql(this.expireCommand)
+    }
   }
 
   async archive () {

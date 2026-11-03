@@ -450,11 +450,14 @@ function completeJobs (schema) {
 
 // Retrying would break job_singleton_queue when a same-key sibling is queued or retries in this
 // statement, so the job goes terminal instead. The LIKE on queued lets it use that index.
+// A sibling past keepUntil is about to be archived, so it can't stand in for the retry.
+// IS NOT NULL stops unkeyed rows running the EXISTS: NULL LIKE is NULL, which doesn't short-circuit.
 function retryCandidates (schema, where) {
   return `candidates AS (
       SELECT j.id,
         j.retryCount < j.retryLimit
           AND j.singletonOn IS NULL
+          AND j.singletonKey IS NOT NULL
           AND j.singletonKey LIKE '${SINGLETON_QUEUE_KEY_ESCAPED}%'
           AND (
             EXISTS (
@@ -465,6 +468,7 @@ function retryCandidates (schema, where) {
                 AND queued.singletonKey LIKE '${SINGLETON_QUEUE_KEY_ESCAPED}%'
                 AND queued.singletonOn IS NULL
                 AND queued.state < '${states.active}'
+                AND queued.keepUntil >= now()
                 AND queued.id <> j.id
             )
             OR row_number() OVER (

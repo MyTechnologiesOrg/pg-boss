@@ -75,7 +75,7 @@ Architecturally, pg-boss is somewhat similar to queue products such as AWS SQS, 
 
 ## Job states
 
-All jobs start out in the `created` state and become `active` when picked up for work. If job processing completes successfully, jobs will go to `completed`. If a job fails, it will typcially enter the `failed` state. However, if a job has retry options configured, it will enter the `retry` state on failure instead and have a chance to re-enter `active` state. It's also possible for `active` jobs to become `expired`, which happens when job processing takes too long. Jobs can also enter `cancelled` state via [`cancel(id)`](#cancelid) or [`cancel([ids])`](#cancelids).
+All jobs start out in the `created` state and become `active` when picked up for work. If job processing completes successfully, jobs will go to `completed`. If a job fails, it will typcially enter the `failed` state. However, if a job has retry options configured, it will enter the `retry` state on failure instead and have a chance to re-enter `active` state. A singleton queue job can end `failed` or `expired` with retries left when another job with the same key takes its place (see [`useSingletonQueue`](#sendname-data-options)). It's also possible for `active` jobs to become `expired`, which happens when job processing takes too long. Jobs can also enter `cancelled` state via [`cancel(id)`](#cancelid) or [`cancel([ids])`](#cancelids).
 
 All jobs that are `completed`, `expired`, `cancelled` or `failed` become eligible for archiving (i.e. they will transition into the `archive` state) after the configured `archiveCompletedAfterSeconds` time. Once `archive`d, jobs will be automatically deleted by pg-boss after the configured deletion period.
 
@@ -483,7 +483,7 @@ Available in constructor as a default, or overridden in send.
 
 * **retryLimit**, int
 
-    Default: 0. Max number of retries of failed jobs. Default is no retries.
+    Default: 0. Max number of retries of failed jobs. Default is no retries. A singleton queue job may not retry while another job with the same key is queued (see `useSingletonQueue` below).
 
 * **retryDelay**, int
 
@@ -574,7 +574,9 @@ Available in constructor as a default, or overridden in send.
 
     >By default, there is no limit on the number of these jobs that may be active. However, this behavior may be modified by passing the [enforceSingletonQueueActiveLimit](#fetch) option.
 
-    >If an active job fails or expires while another job with the same key is already queued, or while another job with the same key retries in the same `fail()` call or expiry pass, it does not retry. It ends `failed` or `expired` with retries left, and the other job serves as its retry.
+    >If an active job fails or expires while another job with the same key is already queued, or while another job with the same key retries in the same `fail()` call or expiry pass, it does not retry. It ends `failed` or `expired` with retries left, and the other job serves as its retry. A queued job past its retention (`keepUntil`) does not count, because it is about to be archived. Maintenance archives before it expires jobs, so an expiring job then retries. `fail()` on the active job throws a unique violation instead, and the job stays `active` until it expires.
+
+    >One case leaves nothing to retry: calling `fail()` on an active job together with a queued job that has the same key and no retries left. Both end `failed`.
 
   ```js
   boss.send('my-job', {}, {singletonKey: '123', useSingletonQueue: true}) // resolves a jobId
@@ -661,7 +663,7 @@ This is a convenience version of `send()` with the `singletonKey` option assigne
 
 Send a job but only allow 1 job to be in created or retry state at at time.
 
-This is a convenience version of `send()` with the `singletonKey` option assigned.
+This is a convenience version of `send()` with the `singletonKey` option assigned. These jobs share the singleton queue behaviour, so a job that fails or expires while another is queued does not retry (see [`useSingletonQueue`](#sendname-data-options)).
 
 ### `sendThrottled(name, data, options, seconds [, key])`
 

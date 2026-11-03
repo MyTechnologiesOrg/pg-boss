@@ -1,4 +1,5 @@
 const assert = require('assert')
+const { randomUUID } = require('crypto')
 const helper = require('./testHelper')
 const pg = require('pg')
 
@@ -14,6 +15,29 @@ describe('singleton queue retry collisions', function () {
     const db = await helper.getDb()
     await db.executeSql(`UPDATE ${schema}.job SET startedOn = now() - interval '1 hour' WHERE id = ANY($1::uuid[])`, [ids])
     await db.close()
+  }
+
+  async function setColumn (schema, id, assignment) {
+    const db = await helper.getDb()
+    await db.executeSql(`UPDATE ${schema}.job SET ${assignment} WHERE id = $1`, [id])
+    await db.close()
+  }
+
+  async function holdUpdateWhile (schema, id, assignment, run) {
+    const client = new pg.Client({ connectionString: helper.getConnectionString() })
+    await client.connect()
+
+    try {
+      await client.query('BEGIN')
+      await client.query(`UPDATE ${schema}.job SET ${assignment} WHERE id = $1`, [id])
+
+      const running = run()
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      await client.query('COMMIT')
+      return await running
+    } finally {
+      await client.end()
+    }
   }
 
   async function getState (schema, id) {
@@ -50,6 +74,7 @@ describe('singleton queue retry collisions', function () {
     assert.strictEqual(result.updated, 1)
 
     assert.deepStrictEqual(await getState(schema, activeId), { state: 'failed', retryCount: 0 })
+    assert.strictEqual((await helper.getJobById(schema, activeId)).output.message, 'boom')
     assert.deepStrictEqual(await getCompletionStates(schema, queue, activeId), [{ state: 'failed', failed: true }])
 
     const next = await boss.fetch(queue, undefined, enforce)
@@ -249,21 +274,142 @@ describe('singleton queue retry collisions', function () {
     await boss.fetch(queue)
     await makeOverdue(schema, [jobId])
 
-    const client = new pg.Client({ connectionString: helper.getConnectionString() })
-    await client.connect()
-
-    try {
-      await client.query('BEGIN')
-      await client.query(`UPDATE ${schema}.job SET startedOn = now() WHERE id = $1`, [jobId])
-
-      const expiring = boss.expire()
-      await new Promise((resolve) => setTimeout(resolve, 500))
-      await client.query('COMMIT')
-      await expiring
-    } finally {
-      await client.end()
-    }
+    await holdUpdateWhile(schema, jobId, 'startedOn = now()', () => boss.expire())
 
     assert.strictEqual((await getState(schema, jobId)).state, 'active')
+  })
+
+  it('fail() fails an active job whose sibling is in retry state', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-fail-retry-sibling'
+
+    const activeId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    const siblingId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    await boss.fail(siblingId)
+    assert.strictEqual((await getState(schema, siblingId)).state, 'retry')
+
+    await boss.fail(activeId)
+
+    assert.strictEqual((await getState(schema, activeId)).state, 'failed')
+    assert.strictEqual((await getState(schema, siblingId)).state, 'retry')
+  })
+
+  it('fail() retries the queued job over a newer active one in the same call', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-fail-queued-first'
+
+    const olderId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    const newerId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    await boss.fail(olderId)
+    assert.strictEqual((await getState(schema, olderId)).state, 'retry')
+
+    await boss.fail([newerId, olderId])
+
+    assert.strictEqual((await getState(schema, olderId)).state, 'retry')
+    assert.strictEqual((await getState(schema, newerId)).state, 'failed')
+  })
+
+  it('fail() fails an active sendSingleton() job whose retry would collide', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-fail-send-singleton'
+
+    const activeId = await boss.sendSingleton(queue, null, { retryLimit: 2 })
+    await boss.fetch(queue, undefined, enforce)
+    const siblingId = await boss.sendSingleton(queue, null, { retryLimit: 2 })
+    assert(siblingId)
+
+    await boss.fail(activeId)
+
+    assert.strictEqual((await getState(schema, activeId)).state, 'failed')
+    assert.strictEqual((await boss.fetch(queue, undefined, enforce)).id, siblingId)
+  })
+
+  it('fail() retries a throttled singleton queue job despite a queued unthrottled sibling', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-fail-throttled'
+
+    const throttledId = await boss.send(queue, null, { ...queueOptions, singletonSeconds: 60 })
+    await boss.fetch(queue)
+    const siblingId = await boss.send(queue, null, queueOptions)
+    assert(siblingId)
+
+    await boss.fail(throttledId)
+
+    assert.strictEqual((await getState(schema, throttledId)).state, 'retry')
+    assert.strictEqual((await getState(schema, siblingId)).state, 'created')
+  })
+
+  it('expire() does not rank a throttled job against an unthrottled one with the same key', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-expire-throttled'
+
+    const unthrottledId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    const throttledId = await boss.send(queue, null, { ...queueOptions, singletonSeconds: 60 })
+    await boss.fetch(queue)
+
+    await makeOverdue(schema, [unthrottledId, throttledId])
+
+    await boss.expire()
+
+    assert.strictEqual((await getState(schema, unthrottledId)).state, 'retry')
+    assert.strictEqual((await getState(schema, throttledId)).state, 'retry')
+  })
+
+  it('maintenance retries an expired job whose queued sibling is past keepUntil', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-maintenance-stale-sibling'
+    const errors = []
+    boss.on('error', (err) => errors.push(err))
+
+    const { activeId, siblingId } = await activeWithQueuedSibling(boss, queue)
+    await makeOverdue(schema, [activeId])
+    await setColumn(schema, siblingId, "keepUntil = now() - interval '1 minute'")
+
+    await boss.boss.onMaintenance({ id: randomUUID() })
+
+    assert.deepStrictEqual(errors, [])
+    assert.strictEqual((await getState(schema, activeId)).state, 'retry')
+    assert(await helper.getArchivedJobById(schema, siblingId))
+  })
+
+  it('fail() does not count a queued sibling past keepUntil as the retry', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-fail-stale-sibling'
+
+    const { activeId, siblingId } = await activeWithQueuedSibling(boss, queue)
+    await setColumn(schema, siblingId, "keepUntil = now() - interval '1 minute'")
+
+    await assert.rejects(boss.fail(activeId), { code: '23505', constraint: 'job_singleton_queue' })
+
+    assert.strictEqual((await getState(schema, activeId)).state, 'active')
+  })
+
+  it('expire() runs again when a same-key job moves to retry after its snapshot', async function () {
+    const boss = await startBoss(this.test)
+    const { schema } = this.test.bossConfig
+    const queue = 'sq-expire-concurrent-retry'
+
+    const overdueId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    const siblingId = await boss.send(queue, null, queueOptions)
+    await boss.fetch(queue)
+    await makeOverdue(schema, [overdueId])
+
+    await holdUpdateWhile(schema, siblingId, "state = 'retry'", () => boss.expire())
+
+    assert.strictEqual((await getState(schema, overdueId)).state, 'expired')
+    assert.strictEqual((await getState(schema, siblingId)).state, 'retry')
   })
 })
