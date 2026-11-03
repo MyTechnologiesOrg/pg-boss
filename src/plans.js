@@ -448,21 +448,74 @@ function completeJobs (schema) {
   `
 }
 
+// job_singleton_queue only covers queued (created, retry) jobs, so a same-key sibling can be queued
+// while a job is active. Moving that job to retry would then violate the index, so it goes terminal
+// instead and the queued sibling stands in as its retry. At most one active job per key retries.
+function retryTargets (schema, targetFilter) {
+  return `
+    targets AS (
+      SELECT id, name, singletonKey, createdOn,
+        state = '${states.active}'
+          AND retryCount < retryLimit
+          AND singletonOn IS NULL
+          AND singletonKey LIKE '${SINGLETON_QUEUE_KEY_ESCAPED}%' AS singleton_queue_retry
+      FROM ${schema}.job
+      WHERE ${targetFilter}
+    ), retry_ranked AS (
+      SELECT id, name, singletonKey,
+        row_number() OVER (PARTITION BY name, singletonKey ORDER BY createdOn, id) AS retry_rank
+      FROM targets
+      WHERE singleton_queue_retry
+    ), retry_targets AS MATERIALIZED (
+      SELECT targets.id,
+        COALESCE(
+          retry_ranked.retry_rank > 1 OR EXISTS (
+            SELECT 1
+            FROM ${schema}.job queued
+            WHERE queued.name = retry_ranked.name
+              AND queued.singletonKey = retry_ranked.singletonKey
+              AND queued.state < '${states.active}'
+              AND queued.singletonOn IS NULL
+              AND queued.singletonKey LIKE '${SINGLETON_QUEUE_KEY_ESCAPED}%'
+          ),
+          false
+        ) AS retry_blocked
+      FROM targets
+      LEFT JOIN retry_ranked ON retry_ranked.id = targets.id
+    )`
+}
+
+function retryStateCase (schema, terminalState) {
+  return `CASE
+          WHEN retryCount < retryLimit AND NOT t.retry_blocked
+          THEN '${states.retry}'::${schema}.job_state
+          ELSE '${terminalState}'::${schema}.job_state
+          END`
+}
+
+const blockableRetryCompletedOnCase = `CASE
+          WHEN t.retry_blocked THEN now()
+          ELSE ${retryCompletedOnCase}
+          END`
+
+const blockableRetryStartAfterCase = `CASE
+          WHEN t.retry_blocked THEN startAfter
+          ELSE ${retryStartAfterCase}
+          END`
+
 function failJobs (schema) {
   return `
-    WITH results AS (
-      UPDATE ${schema}.job
-      SET state = CASE
-          WHEN retryCount < retryLimit
-          THEN '${states.retry}'::${schema}.job_state
-          ELSE '${states.failed}'::${schema}.job_state
-          END,
-        completedOn = ${retryCompletedOnCase},
-        startAfter = ${retryStartAfterCase},
+    WITH ${retryTargets(schema, `id IN (SELECT UNNEST($1::uuid[])) AND state < '${states.completed}'`)},
+    results AS (
+      UPDATE ${schema}.job j
+      SET state = ${retryStateCase(schema, states.failed)},
+        completedOn = ${blockableRetryCompletedOnCase},
+        startAfter = ${blockableRetryStartAfterCase},
         output = $2::jsonb
-      WHERE id IN (SELECT UNNEST($1::uuid[]))
-        AND state < '${states.completed}'
-      RETURNING *
+      FROM retry_targets t
+      WHERE j.id = t.id
+        AND j.state < '${states.completed}'
+      RETURNING j.*
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)
       SELECT
@@ -480,17 +533,16 @@ function failJobs (schema) {
 
 function expire (schema) {
   return `
-    WITH results AS (
-      UPDATE ${schema}.job
-      SET state = CASE
-          WHEN retryCount < retryLimit THEN '${states.retry}'::${schema}.job_state
-          ELSE '${states.expired}'::${schema}.job_state
-          END,
-        completedOn = ${retryCompletedOnCase},
-        startAfter = ${retryStartAfterCase}
-      WHERE state = '${states.active}'
-        AND (startedOn + expireIn) < now()
-      RETURNING *
+    WITH ${retryTargets(schema, `state = '${states.active}' AND (startedOn + expireIn) < now()`)},
+    results AS (
+      UPDATE ${schema}.job j
+      SET state = ${retryStateCase(schema, states.expired)},
+        completedOn = ${blockableRetryCompletedOnCase},
+        startAfter = ${blockableRetryStartAfterCase}
+      FROM retry_targets t
+      WHERE j.id = t.id
+        AND j.state = '${states.active}'
+      RETURNING j.*
     )
     INSERT INTO ${schema}.job (name, data, keepUntil)
     SELECT
