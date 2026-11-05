@@ -30,21 +30,19 @@ jobs:
 
       - name: Calculate Semantic Version
         id: version
-        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7.0.0
+        uses: cruxstack/gh-create-semver-tag-action@81a68a34ab1fb48f4568ddd10e76caf9a608108e # v1.0.0
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          release_branches: main
-          default_bump: minor
-          dry_run: true
+          bump-default: minor
+          dry-run: true
 
       # Consumers install from git tags (`github:MyTechnologiesOrg/pg-boss#semver:^1`),
       # so the tag points at a commit that sets the released version on top of main.
       - name: Create Release Tag
-        if: steps.version.outputs.new_tag != ''
+        if: steps.version.outputs.bump != 'none'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEW_TAG: ${{ steps.version.outputs.new_tag }}
-          NEW_VERSION: ${{ steps.version.outputs.new_version }}
+          NEW_TAG: ${{ steps.version.outputs.tag }}
+          NEW_VERSION: ${{ steps.version.outputs.version }}
         run: |
           npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version
           git add package.json package-lock.json
@@ -55,9 +53,9 @@ jobs:
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW_TAG"
 
       - name: Create Release
-        if: steps.version.outputs.new_tag != ''
+        if: steps.version.outputs.bump != 'none'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+          NEW_TAG: ${{ steps.version.outputs.tag }}
           CHANGELOG: ${{ steps.version.outputs.changelog }}
         run: gh release create "$NEW_TAG" --repo "$GITHUB_REPOSITORY" --title "$NEW_TAG" --notes "$CHANGELOG" --verify-tag
