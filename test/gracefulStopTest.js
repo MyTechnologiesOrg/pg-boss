@@ -17,6 +17,11 @@ describe('graceful stop', function () {
     }
   }
 
+  const getStates = async (schema, queue) => {
+    const { rows } = await helper.findJobs(schema, 'name = $1', [queue])
+    return rows.map(job => job.state)
+  }
+
   it('should wait for teamRefill jobs still running', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
@@ -144,6 +149,24 @@ describe('graceful stop', function () {
     const afterHandler = await helper.getJobById(schema, jobId)
 
     assert.strictEqual(afterHandler.state, 'active')
+  })
+
+  it('should record the results of a batch whose handler replaces its jobs', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    await boss.send(queue)
+    await boss.send(queue)
+
+    await boss.work(queue, { batchSize: 2, newJobCheckInterval: 100 }, async (jobs) => {
+      for (let i = 0; i < jobs.length; i++) {
+        jobs[i] = { ...jobs[i] }
+      }
+    })
+
+    await waitFor(async () => (await getStates(schema, queue)).join() === 'completed,completed')
+    await waitFor(() => boss.manager.getWipData().length === 0)
   })
 
   for (const batchOptions of [{}, { batchSize: 2 }]) {

@@ -72,7 +72,7 @@ class Manager extends EventEmitter {
 
     this.events = events
     this.workers = new Map()
-    this.attemptStartedOn = new WeakMap()
+    this.attempts = new WeakMap()
 
     this.nextJobCommand = plans.fetchNextJob(config.schema)
     this.insertJobCommand = plans.insertJob(config.schema)
@@ -253,14 +253,16 @@ class Manager extends EventEmitter {
 
       if (batchSize) {
         const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expire_in_seconds), 0)
+        // The handler gets the fetched array itself and may change it
+        const fetched = jobs.slice()
 
         try {
           await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          await this.completeAttempts(jobs)
+          await this.completeAttempts(fetched)
         } catch (err) {
-          await this.failAttempts(jobs, err)
+          await this.failAttempts(fetched, err)
         } finally {
-          worker.removeJobs(jobs)
+          worker.removeJobs(fetched)
         }
       } else {
         if (refill) {
@@ -542,7 +544,7 @@ class Manager extends EventEmitter {
 
     if (trackAttempt) {
       for (const job of result.rows) {
-        this.attemptStartedOn.set(job, job[ATTEMPT_STARTED_ON])
+        this.attempts.set(job, { id: job.id, startedOn: job[ATTEMPT_STARTED_ON] })
         delete job[ATTEMPT_STARTED_ON]
       }
     }
@@ -611,8 +613,9 @@ class Manager extends EventEmitter {
   }
 
   async settleAttempts (command, jobs, data) {
-    const ids = jobs.map(job => job.id)
-    const startedOns = jobs.map(job => this.attemptStartedOn.get(job))
+    const attempts = jobs.map(job => this.attempts.get(job))
+    const ids = attempts.map(attempt => attempt.id)
+    const startedOns = attempts.map(attempt => attempt.startedOn)
 
     await this.db.executeSql(command, [ids, this.mapCompletionDataArg(data), startedOns])
   }
