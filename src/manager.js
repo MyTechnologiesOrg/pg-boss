@@ -14,7 +14,10 @@ const { QUEUES: TIMEKEEPER_QUEUES } = require('./timekeeper')
 const INTERNAL_QUEUES = Object.values(BOSS_QUEUES).concat(Object.values(TIMEKEEPER_QUEUES)).reduce((acc, i) => ({ ...acc, [i]: i }), {})
 
 const plans = require('./plans')
-const { COMPLETION_JOB_PREFIX, SINGLETON_QUEUE_KEY } = plans
+const { COMPLETION_JOB_PREFIX, SINGLETON_QUEUE_KEY, ATTEMPT_STARTED_ON } = plans
+
+// A fetch option only workers can pass, so fetch() results keep their shape for everyone else
+const TRACK_ATTEMPT = Symbol('trackAttempt')
 
 const WIP_EVENT_INTERVAL = 2000
 const WIP_DEBOUNCE_OPTIONS = { leading: true, trailing: true, maxWait: WIP_EVENT_INTERVAL }
@@ -69,6 +72,7 @@ class Manager extends EventEmitter {
 
     this.events = events
     this.workers = new Map()
+    this.attemptStartedOn = new WeakMap()
 
     this.nextJobCommand = plans.fetchNextJob(config.schema)
     this.insertJobCommand = plans.insertJob(config.schema)
@@ -77,6 +81,8 @@ class Manager extends EventEmitter {
     this.cancelJobsCommand = plans.cancelJobs(config.schema)
     this.resumeJobsCommand = plans.resumeJobs(config.schema)
     this.failJobsCommand = plans.failJobs(config.schema)
+    this.completeActiveAttemptsCommand = plans.completeActiveAttempts(config.schema)
+    this.failActiveAttemptsCommand = plans.failActiveAttempts(config.schema)
     this.getJobByIdCommand = plans.getJobById(config.schema)
     this.getArchivedJobByIdCommand = plans.getArchivedJobById(config.schema)
     this.subscribeCommand = plans.subscribe(config.schema)
@@ -228,7 +234,7 @@ class Manager extends EventEmitter {
       createTeamRefillPromise()
     }
 
-    const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit })
+    const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit, [TRACK_ATTEMPT]: true })
 
     const onFetch = async (jobs) => {
       if (this.config.__test__throw_worker) {
@@ -250,9 +256,9 @@ class Manager extends EventEmitter {
 
         try {
           await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          await this.complete(jobs.map(job => job.id))
+          await this.completeAttempts(jobs)
         } catch (err) {
-          await this.fail(jobs.map(job => job.id), err)
+          await this.failAttempts(jobs, err)
         } finally {
           worker.removeJobs(jobs)
         }
@@ -264,9 +270,9 @@ class Manager extends EventEmitter {
         const processJob = async (job) => {
           try {
             const result = await resolveWithinSeconds(callback(job), job.expire_in_seconds)
-            await this.complete(job.id, result)
+            await this.completeAttempts([job], result)
           } catch (err) {
-            await this.fail(job.id, err)
+            await this.failAttempts([job], err)
           } finally {
             worker.removeJobs([job])
 
@@ -518,7 +524,8 @@ class Manager extends EventEmitter {
   async fetch (name, batchSize, options = {}) {
     const values = Attorney.checkFetchArgs(name, batchSize, options)
     const db = options.db || this.db
-    const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false)
+    const trackAttempt = options[TRACK_ATTEMPT] === true
+    const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false, trackAttempt)
     const statementValues = [values.name, batchSize || 1]
 
     let result
@@ -531,6 +538,13 @@ class Manager extends EventEmitter {
 
     if (!result || result.rows.length === 0) {
       return null
+    }
+
+    if (trackAttempt) {
+      for (const job of result.rows) {
+        this.attemptStartedOn.set(job, job[ATTEMPT_STARTED_ON])
+        delete job[ATTEMPT_STARTED_ON]
+      }
     }
 
     return result.rows.length === 1 && !batchSize ? result.rows[0] : result.rows
@@ -584,6 +598,23 @@ class Manager extends EventEmitter {
     const ids = this.mapCompletionIdArg(id, 'fail')
     const result = await db.executeSql(this.failJobsCommand, [ids, this.mapCompletionDataArg(data)])
     return this.mapCompletionResponse(ids, result)
+  }
+
+  // Workers settle only the attempt they fetched: a handler still running after its job expired
+  // and was fetched again elsewhere must not complete or fail that newer attempt.
+  async completeAttempts (jobs, data) {
+    await this.settleAttempts(this.completeActiveAttemptsCommand, jobs, data)
+  }
+
+  async failAttempts (jobs, data) {
+    await this.settleAttempts(this.failActiveAttemptsCommand, jobs, data)
+  }
+
+  async settleAttempts (command, jobs, data) {
+    const ids = jobs.map(job => job.id)
+    const startedOns = jobs.map(job => this.attemptStartedOn.get(job))
+
+    await this.db.executeSql(command, [ids, this.mapCompletionDataArg(data), startedOns])
   }
 
   async cancel (id, options = {}) {
