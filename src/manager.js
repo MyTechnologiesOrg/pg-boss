@@ -237,14 +237,12 @@ class Manager extends EventEmitter {
     const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit, [TRACK_ATTEMPT]: true })
 
     const onFetch = async (jobs) => {
-      if (this.config.__test__throw_worker) {
-        throw new Error('__test__throw_worker')
-      }
-
-      // A job stays on the worker until its complete() or fail() settles, so stop() waits for that write too
-      worker.addJobs(jobs)
-
+      // A job stays on the worker until its result is recorded, so stop() waits for that write too
       try {
+        if (this.config.__test__throw_worker) {
+          throw new Error('__test__throw_worker')
+        }
+
         this.emitWip(name)
       } catch (err) {
         worker.removeJobs(jobs)
@@ -258,9 +256,14 @@ class Manager extends EventEmitter {
 
         try {
           await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          await this.completeAttempts(fetched)
+
+          if (worker.settle(fetched)) {
+            await this.completeAttempts(fetched)
+          }
         } catch (err) {
-          await this.failAttempts(fetched, err)
+          if (worker.settle(fetched)) {
+            await this.failAttempts(fetched, err)
+          }
         } finally {
           worker.removeJobs(fetched)
         }
@@ -271,10 +274,22 @@ class Manager extends EventEmitter {
 
         const processJob = async (job) => {
           try {
-            const result = await resolveWithinSeconds(callback(job), job.expire_in_seconds)
-            await this.completeAttempts([job], result)
-          } catch (err) {
-            await this.failAttempts([job], err)
+            // stop() took every job of a released worker to fail it, so this one is never started
+            if (worker.released) {
+              return
+            }
+
+            try {
+              const result = await resolveWithinSeconds(callback(job), job.expire_in_seconds)
+
+              if (worker.settle([job])) {
+                await this.completeAttempts([job], result)
+              }
+            } catch (err) {
+              if (worker.settle([job])) {
+                await this.failAttempts([job], err)
+              }
+            }
           } finally {
             worker.removeJobs([job])
 
@@ -620,8 +635,16 @@ class Manager extends EventEmitter {
     await this.db.executeSql(command, [ids, this.mapCompletionDataArg(data), startedOns])
   }
 
+  // Fails the jobs held by this instance's workers, except those whose result is already being
+  // recorded. Released workers record no later results for them and start no handlers they queued.
   async failActiveJobs () {
-    const jobs = this.getWorkers().flatMap(worker => worker.jobs)
+    const workers = this.getWorkers()
+    const jobs = workers.flatMap(worker => worker.release())
+
+    // A fetch still in flight leaves its jobs on its released worker
+    await Promise.all(workers.map(worker => worker.fetched()))
+
+    jobs.push(...workers.flatMap(worker => worker.release()))
 
     if (jobs.length > 0) {
       await this.failAttempts(jobs, new Error('pg-boss stopped before the job finished'))

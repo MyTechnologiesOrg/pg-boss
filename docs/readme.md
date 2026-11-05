@@ -438,7 +438,7 @@ One example of how this is useful would be including `start()` inside the bootst
 
 All job monitoring will be stopped and all workers on this instance will be removed. Basically, it's the opposite of `start()`. Even though `start()` may create new database objects during initialization, `stop()` will never remove anything from the database.
 
-By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. A job counts as finished once pg-boss has recorded it as completed or failed. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is `true`.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
+By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. A job counts as finished once pg-boss has tried to record its result. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is `true`.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
 
 **Arguments**
 
@@ -461,7 +461,9 @@ By default, calling `stop()` without any arguments will gracefully wait for all 
 
   * `failActive`, bool
 
-    Default: `false`. If `true`, jobs this instance is still processing when `stop()` stops waiting for them (once `timeout` passes, or straight away when `graceful` is `false`) are failed before the connection pool is closed. They then retry according to their retry options instead of staying `active` until they expire. Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. Handlers are not interrupted, and when one finishes later its result is not recorded, since a worker only completes or fails the attempt it fetched while that attempt is still `active`.
+    Default: `false`. If `true`, jobs this instance's workers still hold when `stop()` stops waiting for them (once `timeout` passes, or straight away when `graceful` is `false`) are failed before the connection pool is closed. They then retry according to their retry options instead of staying `active` until they expire. This covers the jobs of every `work()` and `onComplete()` worker on this instance, pg-boss's own maintenance and cron workers included, and the jobs a fetch still in progress returns. It doesn't cover jobs taken with `fetch()`.
+
+    Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. A job whose handler has already finished keeps the result its worker is recording. Handlers that are still running are not interrupted, and their results are not recorded. Team jobs still waiting for a free slot (see `teamConcurrency`) are failed too, and their handlers never start.
 
 
 ## `send()`

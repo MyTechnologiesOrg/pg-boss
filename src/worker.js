@@ -28,19 +28,64 @@ class Worker {
     this.stopped = false
     this.loopDelayPromise = null
     this.beenNotified = false
+    this.fetching = null
+    this.settling = new Set()
+    this.released = false
     this.onJobsRemoved = null
   }
 
-  addJobs (jobs) {
-    this.jobs = this.jobs.concat(jobs)
+  // Jobs are tracked as soon as their fetch returns, so stop() can find them before onFetch runs
+  async fetchJobs () {
+    const jobs = await this.fetch()
+
+    if (jobs) {
+      this.jobs = this.jobs.concat(jobs)
+    }
+
+    return jobs
+  }
+
+  async fetched () {
+    try {
+      await this.fetching
+    } catch {}
   }
 
   removeJobs (jobs) {
     this.jobs = this.jobs.filter(job => !jobs.includes(job))
 
+    for (const job of jobs) {
+      this.settling.delete(job)
+    }
+
     if (this.onJobsRemoved) {
       this.onJobsRemoved()
     }
+  }
+
+  // Claims the jobs for recording their handler's result, unless release() has already taken them
+  settle (jobs) {
+    if (!jobs.every(job => this.jobs.includes(job))) {
+      return false
+    }
+
+    for (const job of jobs) {
+      this.settling.add(job)
+    }
+
+    return true
+  }
+
+  // Hands stop() every job whose result isn't already being recorded. A released worker starts
+  // no more handlers and leaves what it fetches afterwards for the next release() call.
+  release () {
+    this.released = true
+
+    const jobs = this.jobs.filter(job => !this.settling.has(job))
+
+    this.removeJobs(jobs)
+
+    return jobs
   }
 
   notify () {
@@ -59,11 +104,12 @@ class Worker {
 
       try {
         this.beenNotified = false
-        const jobs = await this.fetch()
+        this.fetching = this.fetchJobs()
+        const jobs = await this.fetching
 
         this.lastFetchedOn = Date.now()
 
-        if (jobs) {
+        if (jobs && !this.released) {
           this.lastJobStartedOn = this.lastFetchedOn
 
           await this.onFetch(jobs)
@@ -90,7 +136,8 @@ class Worker {
       }
     }
 
-    // A teamRefill worker leaves the loop while jobs it fetched are still running
+    // A teamRefill worker leaves the loop while jobs it fetched are still running, and a released
+    // worker may still hold jobs that stop() is about to fail
     while (this.jobs.length > 0) {
       await new Promise(resolve => { this.onJobsRemoved = resolve })
     }
