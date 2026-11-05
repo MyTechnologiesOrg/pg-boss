@@ -60,6 +60,8 @@ const resolveWithinSeconds = async (promise, seconds) => {
   return result
 }
 
+const invoke = async (handler, arg) => await handler(arg)
+
 class Manager extends EventEmitter {
   constructor (db, config) {
     super()
@@ -74,9 +76,11 @@ class Manager extends EventEmitter {
     this.insertJobCommand = plans.insertJob(config.schema)
     this.insertJobsCommand = plans.insertJobs(config.schema)
     this.completeJobsCommand = plans.completeJobs(config.schema)
+    this.completeAttemptsCommand = plans.completeJobs(config.schema, true)
     this.cancelJobsCommand = plans.cancelJobs(config.schema)
     this.resumeJobsCommand = plans.resumeJobs(config.schema)
     this.failJobsCommand = plans.failJobs(config.schema)
+    this.failAttemptsCommand = plans.failJobs(config.schema, true)
     this.getJobByIdCommand = plans.getJobById(config.schema)
     this.getArchivedJobByIdCommand = plans.getArchivedJobById(config.schema)
     this.subscribeCommand = plans.subscribe(config.schema)
@@ -192,6 +196,39 @@ class Manager extends EventEmitter {
     return data
   }
 
+  hasRunningWorkers (options = {}) {
+    const { includeInternal = false } = options
+
+    return this.getWorkers().some(worker => !worker.stopped && (includeInternal || !INTERNAL_QUEUES[worker.name]))
+  }
+
+  async failHeldJobs (error) {
+    const workers = this.getWorkers()
+
+    for (const worker of workers) {
+      worker.abandoned = true
+    }
+
+    // jobs a fetch already marked active are only handed back once it returns
+    await Promise.all(workers.map(worker => worker.waitForFetch()))
+
+    const held = workers.flatMap(worker => worker.abandon().map(entry => ({ worker, entry })))
+
+    if (held.length === 0) {
+      return 0
+    }
+
+    try {
+      await this.failAttempts(held.map(({ entry }) => entry), error)
+    } finally {
+      for (const { worker, entry } of held) {
+        worker.release(entry)
+      }
+    }
+
+    return held.length
+  }
+
   async watch (name, options, callback) {
     if (this.stopping) {
       throw new Error('Workers are disabled. pg-boss is stopping.')
@@ -228,9 +265,60 @@ class Manager extends EventEmitter {
       createTeamRefillPromise()
     }
 
-    const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit })
+    const fetch = async () => {
+      const rows = await this.fetchJobs(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit }, true)
 
-    const onFetch = async (jobs) => {
+      if (!rows) {
+        return null
+      }
+
+      return [].concat(rows).map(({ attempt_token: attempt, ...job }) => ({ job, attempt, abandoned: false }))
+    }
+
+    const settle = async (entries, run, withResult) => {
+      let failed = false
+      let outcome
+
+      try {
+        outcome = await run()
+      } catch (err) {
+        failed = true
+        outcome = err
+      }
+
+      if (entries.some(entry => entry.abandoned)) {
+        return
+      }
+
+      if (!failed) {
+        try {
+          await this.completeAttempts(entries, withResult ? outcome : undefined)
+          return
+        } catch (err) {
+          outcome = err
+        }
+      }
+
+      await this.failAttempts(entries, outcome)
+    }
+
+    const runJob = async (entry) => {
+      try {
+        if (!entry.abandoned) {
+          await settle([entry], () => resolveWithinSeconds(invoke(callback, entry.job), entry.job.expire_in_seconds), true)
+        }
+      } catch {
+        // a failed fail() was never surfaced in team mode
+      } finally {
+        worker.release(entry)
+
+        if (refill) {
+          onRefill()
+        }
+      }
+    }
+
+    const onFetch = async (entries) => {
       if (this.config.__test__throw_worker) {
         throw new Error('__test__throw_worker')
       }
@@ -238,23 +326,22 @@ class Manager extends EventEmitter {
       this.emitWip(name)
 
       if (batchSize) {
+        const jobs = entries.map(entry => entry.job)
         const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expire_in_seconds), 0)
 
-        await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          .then(() => this.complete(jobs.map(job => job.id)))
-          .catch(err => this.fail(jobs.map(job => job.id), err))
+        try {
+          await settle(entries, () => resolveWithinSeconds(invoke(callback, jobs), maxExpiration), false)
+        } finally {
+          for (const entry of entries) {
+            worker.release(entry)
+          }
+        }
       } else {
         if (refill) {
-          queueSize += jobs.length || 1
+          queueSize += entries.length || 1
         }
 
-        const allTeamPromise = pMap(jobs, job =>
-          resolveWithinSeconds(callback(job), job.expire_in_seconds)
-            .then(result => this.complete(job.id, result))
-            .catch(err => this.fail(job.id, err))
-            .then(() => refill ? onRefill() : null)
-        , { concurrency: teamConcurrency }
-        ).catch(() => {}) // allow promises & non-promises to live together in harmony
+        const allTeamPromise = pMap(entries, runJob, { concurrency: teamConcurrency })
 
         if (refill) {
           if (queueSize < teamSize) {
@@ -492,9 +579,13 @@ class Manager extends EventEmitter {
   }
 
   async fetch (name, batchSize, options = {}) {
+    return await this.fetchJobs(name, batchSize, options, false)
+  }
+
+  async fetchJobs (name, batchSize, options, includeAttempt) {
     const values = Attorney.checkFetchArgs(name, batchSize, options)
     const db = options.db || this.db
-    const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false)
+    const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false, includeAttempt)
     const statementValues = [values.name, batchSize || 1]
 
     let result
@@ -560,6 +651,20 @@ class Manager extends EventEmitter {
     const ids = this.mapCompletionIdArg(id, 'fail')
     const result = await db.executeSql(this.failJobsCommand, [ids, this.mapCompletionDataArg(data)])
     return this.mapCompletionResponse(ids, result)
+  }
+
+  async completeAttempts (entries, data) {
+    const result = await this.db.executeSql(this.completeAttemptsCommand, this.mapAttemptValues(entries, data))
+    return this.mapCompletionResponse(entries.map(entry => entry.job.id), result)
+  }
+
+  async failAttempts (entries, data) {
+    const result = await this.db.executeSql(this.failAttemptsCommand, this.mapAttemptValues(entries, data))
+    return this.mapCompletionResponse(entries.map(entry => entry.job.id), result)
+  }
+
+  mapAttemptValues (entries, data) {
+    return [entries.map(entry => entry.job.id), this.mapCompletionDataArg(data), entries.map(entry => entry.attempt)]
   }
 
   async cancel (id, options = {}) {

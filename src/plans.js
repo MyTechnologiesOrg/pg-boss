@@ -350,8 +350,12 @@ function insertVersion (schema, version) {
   return `INSERT INTO ${schema}.version(version) VALUES ('${version}')`
 }
 
+// a job's id is reused by its retries, so startedOn (set by each fetch) identifies one attempt; UTC text keeps the microseconds a JS Date drops
+const ATTEMPT_TOKEN = 'to_char(j.startedOn AT TIME ZONE \'UTC\', \'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+const attemptMatch = (alias = '') => `(${alias}id, ${alias}startedOn) IN (SELECT * FROM UNNEST($1::uuid[], $3::timestamptz[]))`
+
 function fetchNextJob (schema) {
-  return (includeMetadata, enforceSingletonQueueActiveLimit) => `
+  return (includeMetadata, enforceSingletonQueueActiveLimit, includeAttempt = false) => `
     WITH nextJob as (
       SELECT id
       FROM ${schema}.job j
@@ -386,7 +390,7 @@ function fetchNextJob (schema) {
       retryCount = CASE WHEN state = '${states.retry}' THEN retryCount + 1 ELSE retryCount END
     FROM nextJob
     WHERE j.id = nextJob.id
-    RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds
+    RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds${includeAttempt ? `, ${ATTEMPT_TOKEN} as attempt_token` : ''}
   `
 }
 
@@ -424,14 +428,14 @@ const retryStartAfterCase = `CASE
 
 const keepUntilInheritance = 'keepUntil + (keepUntil - startAfter)'
 
-function completeJobs (schema) {
+function completeJobs (schema, byAttempt = false) {
   return `
     WITH results AS (
       UPDATE ${schema}.job
       SET completedOn = now(),
         state = '${states.completed}',
         output = $2::jsonb
-      WHERE id IN (SELECT UNNEST($1::uuid[]))
+      WHERE ${byAttempt ? attemptMatch() : 'id IN (SELECT UNNEST($1::uuid[]))'}
         AND state = '${states.active}'
       RETURNING *
     ), completion_jobs as (
@@ -481,8 +485,11 @@ function retryCandidates (schema, where) {
     )`
 }
 
-function failJobs (schema) {
-  const where = `id IN (SELECT UNNEST($1::uuid[]))
+function failJobs (schema, byAttempt = false) {
+  const where = byAttempt
+    ? `${attemptMatch()}
+        AND state = '${states.active}'`
+    : `id IN (SELECT UNNEST($1::uuid[]))
         AND state < '${states.completed}'`
 
   return `
@@ -499,7 +506,7 @@ function failJobs (schema) {
         output = $2::jsonb
       FROM candidates c
       WHERE j.id = c.id
-        AND j.state < '${states.completed}'
+        AND ${byAttempt ? `j.state = '${states.active}' AND ${attemptMatch('j.')}` : `j.state < '${states.completed}'`}
       RETURNING j.*
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)

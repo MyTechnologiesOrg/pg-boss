@@ -53,6 +53,7 @@ class PgBoss extends EventEmitter {
     manager.timekeeper = timekeeper
 
     this.stoppingOn = null
+    this.stopState = null
     this.stopped = true
     this.config = config
     this.db = db
@@ -117,64 +118,118 @@ class PgBoss extends EventEmitter {
   }
 
   async stop (options = {}) {
-    if (this.stoppingOn) {
-      return
+    if (this.stopState) {
+      return await this.joinStop(options)
     }
 
     if (this.stopped) {
       this.emit(events.stopped)
     }
 
-    let { destroy = false, graceful = true, timeout = 30000 } = options
-
-    timeout = Math.max(timeout, 1000)
+    const { destroy = false, graceful = true, timeout = 30000, wait = false, failOnTimeout = false } = options
 
     this.stoppingOn = Date.now()
 
-    await this.manager.stop()
-    await this.timekeeper.stop()
-
-    const shutdown = async () => {
-      this.stopped = true
-      this.stoppingOn = null
-
-      if (this.db.isOurs && this.db.opened && destroy) {
-        await this.db.close()
-      }
-
-      this.emit(events.stopped)
+    const state = {
+      deadline: graceful ? this.stoppingOn + Math.max(timeout, 1000) : this.stoppingOn,
+      destroy,
+      failOnTimeout,
+      sleep: null,
+      ready: null,
+      promise: null
     }
 
-    if (!graceful) {
-      await this.boss.stop()
-      await shutdown()
+    this.stopState = state
+
+    state.ready = this.stopWorkers()
+
+    await state.ready
+
+    state.promise = this.drain(state)
+
+    if (!graceful || wait) {
+      await state.promise
       return
     }
 
-    setImmediate(async () => {
-      let closing = false
+    this.emitStopErrors(state.promise)
+  }
 
-      try {
-        while (Date.now() - this.stoppingOn < timeout) {
-          if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
-            if (closing) {
-              break
-            }
+  // a stop() during a stop can only bring its deadline forward or add destroy/failOnTimeout
+  async joinStop (options) {
+    const state = this.stopState
+    const { destroy = false, graceful = true, timeout, wait = false, failOnTimeout = false } = options
 
-            closing = true
+    if (!graceful) {
+      state.deadline = Math.min(state.deadline, Date.now())
+    } else if (timeout !== undefined) {
+      state.deadline = Math.min(state.deadline, Date.now() + Math.max(timeout, 1000))
+    }
 
-            await this.boss.stop()
-          }
+    state.destroy = state.destroy || destroy
+    state.failOnTimeout = state.failOnTimeout || failOnTimeout
 
-          await delay(1000)
+    if (state.sleep) {
+      state.sleep.clear()
+    }
+
+    if (wait) {
+      await state.ready
+      await state.promise
+    }
+  }
+
+  async stopWorkers () {
+    await this.manager.stop()
+    await this.timekeeper.stop()
+  }
+
+  async emitStopErrors (promise) {
+    try {
+      await promise
+    } catch (err) {
+      this.emit(events.error, err)
+    }
+  }
+
+  async drain (state) {
+    let closing = false
+
+    while (Date.now() < state.deadline) {
+      if (!this.manager.hasRunningWorkers({ includeInternal: closing })) {
+        if (closing) {
+          break
         }
 
+        closing = true
+
         await this.boss.stop()
-        await shutdown()
+      }
+
+      state.sleep = delay(Math.max(0, Math.min(1000, state.deadline - Date.now())))
+      await state.sleep
+      state.sleep = null
+    }
+
+    await this.boss.stop()
+
+    if (state.failOnTimeout) {
+      try {
+        await this.manager.failHeldJobs(new Error('pg-boss stopped before the job finished'))
       } catch (err) {
         this.emit(events.error, err)
       }
-    })
+    }
+
+    this.stopped = true
+    this.stoppingOn = null
+    this.stopState = null
+
+    if (this.db.isOurs && this.db.opened && state.destroy) {
+      await this.db.close()
+    }
+
+    this.emit(events.stopped)
   }
 }
 

@@ -16,7 +16,10 @@ class Worker {
     this.onFetch = onFetch
     this.onError = onError
     this.interval = interval
-    this.jobs = []
+    this.held = new Set()
+    this.fetching = null
+    this.abandoned = false
+    this.onRelease = null
     this.createdOn = Date.now()
     this.lastFetchedOn = null
     this.lastJobStartedOn = null
@@ -28,6 +31,52 @@ class Worker {
     this.stopped = false
     this.loopDelayPromise = null
     this.beenNotified = false
+  }
+
+  get jobs () {
+    return Array.from(this.held, entry => entry.job)
+  }
+
+  async fetchAndHold () {
+    const entries = (await this.fetch()) || []
+
+    for (const entry of entries) {
+      entry.abandoned = this.abandoned
+      this.held.add(entry)
+    }
+
+    return entries
+  }
+
+  async waitForFetch () {
+    if (this.fetching) {
+      try {
+        await this.fetching
+      } catch {}
+    }
+  }
+
+  release (entry) {
+    if (this.held.delete(entry) && this.onRelease) {
+      this.onRelease()
+    }
+  }
+
+  abandon () {
+    this.abandoned = true
+
+    for (const entry of this.held) {
+      entry.abandoned = true
+    }
+
+    return Array.from(this.held)
+  }
+
+  async waitForRelease () {
+    while (this.held.size > 0) {
+      await new Promise(resolve => { this.onRelease = resolve })
+      this.onRelease = null
+    }
   }
 
   notify () {
@@ -44,24 +93,35 @@ class Worker {
     while (!this.stopping) {
       const started = Date.now()
 
+      let entries = []
+
       try {
         this.beenNotified = false
-        const jobs = await this.fetch()
+
+        this.fetching = this.fetchAndHold()
+
+        try {
+          entries = await this.fetching
+        } finally {
+          this.fetching = null
+        }
 
         this.lastFetchedOn = Date.now()
 
-        if (jobs) {
-          this.jobs = jobs
-
+        if (entries.length > 0 && !this.abandoned) {
           this.lastJobStartedOn = this.lastFetchedOn
 
-          await this.onFetch(jobs)
+          await this.onFetch(entries)
 
           this.lastJobEndedOn = Date.now()
-
-          this.jobs = []
         }
       } catch (err) {
+        for (const entry of entries) {
+          if (!entry.abandoned) {
+            this.release(entry)
+          }
+        }
+
         this.lastErrorOn = Date.now()
         this.lastError = err
 
@@ -80,6 +140,8 @@ class Worker {
         this.loopDelayPromise = null
       }
     }
+
+    await this.waitForRelease()
 
     this.stopping = false
     this.stopped = true
