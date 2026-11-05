@@ -235,26 +235,50 @@ class Manager extends EventEmitter {
         throw new Error('__test__throw_worker')
       }
 
-      this.emitWip(name)
+      // A job stays on the worker until its complete() or fail() settles, so stop() waits for that write too
+      worker.addJobs(jobs)
+
+      try {
+        this.emitWip(name)
+      } catch (err) {
+        worker.removeJobs(jobs)
+        throw err
+      }
 
       if (batchSize) {
         const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expire_in_seconds), 0)
 
-        await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          .then(() => this.complete(jobs.map(job => job.id)))
-          .catch(err => this.fail(jobs.map(job => job.id), err))
+        try {
+          await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
+          await this.complete(jobs.map(job => job.id))
+        } catch (err) {
+          await this.fail(jobs.map(job => job.id), err)
+        } finally {
+          worker.removeJobs(jobs)
+        }
       } else {
         if (refill) {
           queueSize += jobs.length || 1
         }
 
-        const allTeamPromise = pMap(jobs, job =>
-          resolveWithinSeconds(callback(job), job.expire_in_seconds)
-            .then(result => this.complete(job.id, result))
-            .catch(err => this.fail(job.id, err))
-            .then(() => refill ? onRefill() : null)
-        , { concurrency: teamConcurrency }
-        ).catch(() => {}) // allow promises & non-promises to live together in harmony
+        const processJob = async (job) => {
+          try {
+            const result = await resolveWithinSeconds(callback(job), job.expire_in_seconds)
+            await this.complete(job.id, result)
+          } catch (err) {
+            await this.fail(job.id, err)
+          } finally {
+            worker.removeJobs([job])
+
+            if (refill) {
+              onRefill()
+            }
+          }
+        }
+
+        // Without stopOnError: false, one rejected fail() would leave the rest of the team fetched but never run
+        const allTeamPromise = pMap(jobs, processJob, { concurrency: teamConcurrency, stopOnError: false })
+          .catch(() => {})
 
         if (refill) {
           if (queueSize < teamSize) {

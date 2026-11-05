@@ -28,6 +28,19 @@ class Worker {
     this.stopped = false
     this.loopDelayPromise = null
     this.beenNotified = false
+    this.onJobsRemoved = null
+  }
+
+  addJobs (jobs) {
+    this.jobs = this.jobs.concat(jobs)
+  }
+
+  removeJobs (jobs) {
+    this.jobs = this.jobs.filter(job => !jobs.includes(job))
+
+    if (this.onJobsRemoved) {
+      this.onJobsRemoved()
+    }
   }
 
   notify () {
@@ -51,15 +64,11 @@ class Worker {
         this.lastFetchedOn = Date.now()
 
         if (jobs) {
-          this.jobs = jobs
-
           this.lastJobStartedOn = this.lastFetchedOn
 
           await this.onFetch(jobs)
 
           this.lastJobEndedOn = Date.now()
-
-          this.jobs = []
         }
       } catch (err) {
         this.lastErrorOn = Date.now()
@@ -79,6 +88,11 @@ class Worker {
         await this.loopDelayPromise
         this.loopDelayPromise = null
       }
+    }
+
+    // A teamRefill worker leaves the loop while jobs it fetched are still running
+    while (this.jobs.length > 0) {
+      await new Promise(resolve => { this.onJobsRemoved = resolve })
     }
 
     this.stopping = false
