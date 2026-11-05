@@ -82,5 +82,9 @@
     "url": "https://github.com/MyTechnologiesOrg/pg-boss/issues"
   },
   "homepage": "https://github.com/MyTechnologiesOrg/pg-boss#readme",
-  "types": "./types.d.ts"
+  "types": "./types.d.ts",
+  "overrides": {
+    "glob@^13": "^14.0.3",
+    "minimatch@^10": "^11.0.3"
+  }
 }
