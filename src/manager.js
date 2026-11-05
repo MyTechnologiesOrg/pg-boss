@@ -617,6 +617,14 @@ class Manager extends EventEmitter {
     await this.db.executeSql(command, [ids, this.mapCompletionDataArg(data), startedOns])
   }
 
+  async failActiveJobs () {
+    const jobs = this.getWorkers().flatMap(worker => worker.jobs)
+
+    if (jobs.length > 0) {
+      await this.failAttempts(jobs, new Error('pg-boss stopped before the job finished'))
+    }
+  }
+
   async cancel (id, options = {}) {
     const db = options.db || this.db
     const ids = this.mapCompletionIdArg(id, 'cancel')

@@ -47,6 +47,64 @@ describe('graceful stop', function () {
     assert.deepStrictEqual(rows.map(job => job.state), ['completed', 'completed'])
   })
 
+  it('should resolve stop() once stopped when wait is true', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let started = false
+    let finished = false
+    let stoppedEmitted = false
+
+    boss.once('stopped', () => { stoppedEmitted = true })
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, async () => {
+      started = true
+      await delay(1500)
+      finished = true
+    })
+
+    await waitFor(() => started)
+
+    await boss.stop({ timeout: 8000, wait: true })
+
+    assert(finished)
+    assert(stoppedEmitted)
+  })
+
+  it('should fail jobs still running at the timeout when failActive is true', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue, null, { retryLimit: 1, retryDelay: 60 })
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    await boss.stop({ timeout: 1000, wait: true, failActive: true })
+
+    const failed = await helper.getJobById(schema, jobId)
+
+    assert.strictEqual(failed.state, 'retry')
+    assert.strictEqual(failed.output.message, 'pg-boss stopped before the job finished')
+
+    release()
+    await delay(500)
+
+    const afterHandler = await helper.getJobById(schema, jobId)
+
+    assert.strictEqual(afterHandler.state, 'retry')
+  })
+
   it('should leave a newer attempt of the job alone', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
@@ -72,6 +130,13 @@ describe('graceful stop', function () {
     const newerAttempt = await boss.fetch(queue)
 
     assert.strictEqual(newerAttempt.id, jobId)
+
+    await boss.stop({ graceful: false, failActive: true })
+
+    const afterStop = await helper.getJobById(schema, jobId)
+
+    assert.strictEqual(afterStop.state, 'active')
+    assert.strictEqual(afterStop.retrycount, 1)
 
     release()
     await delay(500)

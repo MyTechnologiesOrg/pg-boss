@@ -125,7 +125,7 @@ class PgBoss extends EventEmitter {
       this.emit(events.stopped)
     }
 
-    let { destroy = false, graceful = true, timeout = 30000 } = options
+    let { destroy = false, graceful = true, timeout = 30000, wait = false, failActive = false } = options
 
     timeout = Math.max(timeout, 1000)
 
@@ -135,6 +135,16 @@ class PgBoss extends EventEmitter {
     await this.timekeeper.stop()
 
     const shutdown = async () => {
+      let failActiveError = null
+
+      if (failActive) {
+        try {
+          await this.manager.failActiveJobs()
+        } catch (err) {
+          failActiveError = err
+        }
+      }
+
       this.stopped = true
       this.stoppingOn = null
 
@@ -143,6 +153,10 @@ class PgBoss extends EventEmitter {
       }
 
       this.emit(events.stopped)
+
+      if (failActiveError) {
+        throw failActiveError
+      }
     }
 
     if (!graceful) {
@@ -151,26 +165,35 @@ class PgBoss extends EventEmitter {
       return
     }
 
-    setImmediate(async () => {
+    const drain = async () => {
       let closing = false
 
-      try {
-        while (Date.now() - this.stoppingOn < timeout) {
-          if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
-            if (closing) {
-              break
-            }
-
-            closing = true
-
-            await this.boss.stop()
+      while (Date.now() - this.stoppingOn < timeout) {
+        if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
+          if (closing) {
+            break
           }
 
-          await delay(1000)
+          closing = true
+
+          await this.boss.stop()
         }
 
-        await this.boss.stop()
-        await shutdown()
+        await delay(1000)
+      }
+
+      await this.boss.stop()
+      await shutdown()
+    }
+
+    if (wait) {
+      await drain()
+      return
+    }
+
+    setImmediate(async () => {
+      try {
+        await drain()
       } catch (err) {
         this.emit(events.error, err)
       }
