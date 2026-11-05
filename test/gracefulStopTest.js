@@ -139,6 +139,70 @@ describe('graceful stop', function () {
     assert(stoppedEmitted)
   })
 
+  it('should reject stop() when wait is true and the stop fails', async function () {
+    const boss = await helper.start({ ...this.test.bossConfig, ...defaults, __test__throw_stop: 'boss stop failed' })
+
+    await assert.rejects(boss.stop({ timeout: 1000, wait: true }), { message: 'boss stop failed' })
+
+    await boss.db.close()
+  })
+
+  it('should let a later stop() with wait: true wait for the running stop', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let started = false
+    let finished = false
+    let stoppedEmitted = false
+
+    boss.once('stopped', () => { stoppedEmitted = true })
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, async () => {
+      started = true
+      await delay(1500)
+      finished = true
+    })
+
+    await waitFor(() => started)
+
+    await boss.stop({ timeout: 8000 })
+    await boss.stop({ wait: true })
+
+    assert(finished)
+    assert(stoppedEmitted)
+  })
+
+  it('should let a later stop() end the wait of a running stop and fail its jobs', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue, null, { retryLimit: 1, retryDelay: 60 })
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    await boss.stop({ timeout: 30000 })
+    await boss.stop({ graceful: false, failActive: true })
+
+    assert(boss.stopped)
+
+    const job = await helper.getJobById(schema, jobId)
+
+    assert.strictEqual(job.state, 'retry')
+
+    release()
+  })
+
   it('should fail jobs still running at the timeout when failActive is true', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
@@ -278,6 +342,44 @@ describe('graceful stop', function () {
     await delay(300)
 
     assert.strictEqual(started, false)
+  })
+
+  it('should finish the stop before reporting a failActive error', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    const executeSql = boss.db.executeSql.bind(boss.db)
+
+    boss.db.executeSql = async (text, values) => {
+      if (text === boss.manager.failActiveAttemptsCommand) {
+        throw new Error('fail write failed')
+      }
+
+      return await executeSql(text, values)
+    }
+
+    let stoppedEmitted = false
+
+    boss.once('stopped', () => { stoppedEmitted = true })
+
+    await assert.rejects(boss.stop({ graceful: false, failActive: true }), { message: 'fail write failed' })
+
+    assert(stoppedEmitted)
+    assert(boss.stopped)
+
+    release()
   })
 
   it('should leave a newer attempt of the job alone', async function () {

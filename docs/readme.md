@@ -440,6 +440,8 @@ All job monitoring will be stopped and all workers on this instance will be remo
 
 By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. A job counts as finished once pg-boss has tried to record its result. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is `true`.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
 
+Calling `stop()` while a stop is in progress doesn't start a second one. The call joins the running stop, which then stops waiting at the earlier of the two deadlines (straight away if the later call has `graceful: false`). The running stop also closes the pool or fails active jobs if the later call asks for it and the stop hasn't passed that step yet. Like a first call, the later call resolves once the stop has finished if it has `wait: true` or `graceful: false`, and straight away otherwise.
+
 **Arguments**
 
 * `options`: object
@@ -464,6 +466,8 @@ By default, calling `stop()` without any arguments will gracefully wait for all 
     Default: `false`. If `true`, jobs this instance's workers still hold when `stop()` stops waiting for them (once `timeout` passes, or straight away when `graceful` is `false`) are failed before the connection pool is closed. They then retry according to their retry options instead of staying `active` until they expire. This covers the jobs of every `work()` and `onComplete()` worker on this instance, pg-boss's own maintenance and cron workers included, and the jobs a fetch still in progress returns. It doesn't cover jobs taken with `fetch()`.
 
     Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. A job whose handler has already finished keeps the result its worker is recording. Handlers that are still running are not interrupted, and their results are not recorded. Team jobs still waiting for a free slot (see `teamConcurrency`) are failed too, and their handlers never start.
+
+    If failing the jobs fails, the stop still finishes: `stopped` is emitted and, with `destroy`, the pool is closed. The error is reported afterwards, by rejecting `stop()` if it waits for the stop, or as an `error` event otherwise. Calling `stop()` again won't fail those jobs, since the stop that released them has finished.
 
 
 ## `send()`

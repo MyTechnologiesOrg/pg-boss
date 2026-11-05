@@ -53,6 +53,7 @@ class PgBoss extends EventEmitter {
     manager.timekeeper = timekeeper
 
     this.stoppingOn = null
+    this.currentStop = null
     this.stopped = true
     this.config = config
     this.db = db
@@ -117,7 +118,26 @@ class PgBoss extends EventEmitter {
   }
 
   async stop (options = {}) {
-    if (this.stoppingOn) {
+    const { destroy = false, graceful = true, timeout = 30000, wait = false, failActive = false } = options
+    const deadline = Date.now() + (graceful ? Math.max(timeout, 1000) : 0)
+    const waits = wait || !graceful
+
+    if (this.currentStop) {
+      // A stop() made while another is running joins it: the earlier deadline wins, and destroy and failActive add up
+      const stop = this.currentStop
+
+      stop.deadline = Math.min(stop.deadline, deadline)
+      stop.destroy = stop.destroy || destroy
+      stop.failActive = stop.failActive || failActive
+
+      if (stop.sleep) {
+        stop.sleep.clear()
+      }
+
+      if (waits) {
+        await stop.promise
+      }
+
       return
     }
 
@@ -125,50 +145,19 @@ class PgBoss extends EventEmitter {
       this.emit(events.stopped)
     }
 
-    let { destroy = false, graceful = true, timeout = 30000, wait = false, failActive = false } = options
-
-    timeout = Math.max(timeout, 1000)
-
     this.stoppingOn = Date.now()
 
-    await this.manager.stop()
-    await this.timekeeper.stop()
+    const stop = this.currentStop = { deadline, destroy, failActive, sleep: null }
 
-    const shutdown = async () => {
-      let failActiveError = null
-
-      if (failActive) {
-        try {
-          await this.manager.failActiveJobs()
-        } catch (err) {
-          failActiveError = err
-        }
-      }
-
-      this.stopped = true
-      this.stoppingOn = null
-
-      if (this.db.isOurs && this.db.opened && destroy) {
-        await this.db.close()
-      }
-
-      this.emit(events.stopped)
-
-      if (failActiveError) {
-        throw failActiveError
-      }
+    const stopWorkers = async () => {
+      await this.manager.stop()
+      await this.timekeeper.stop()
     }
 
-    if (!graceful) {
-      await this.boss.stop()
-      await shutdown()
-      return
-    }
-
-    const drain = async () => {
+    const finish = async () => {
       let closing = false
 
-      while (Date.now() - this.stoppingOn < timeout) {
+      while (Date.now() < stop.deadline) {
         if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
           if (closing) {
             break
@@ -179,25 +168,55 @@ class PgBoss extends EventEmitter {
           await this.boss.stop()
         }
 
-        await delay(1000)
+        stop.sleep = delay(1000)
+        await stop.sleep
+        stop.sleep = null
       }
 
       await this.boss.stop()
-      await shutdown()
-    }
 
-    if (wait) {
-      await drain()
-      return
-    }
+      let failActiveError = null
 
-    setImmediate(async () => {
-      try {
-        await drain()
-      } catch (err) {
-        this.emit(events.error, err)
+      if (stop.failActive) {
+        try {
+          await this.manager.failActiveJobs()
+        } catch (err) {
+          failActiveError = err
+        }
       }
-    })
+
+      this.stopped = true
+      this.stoppingOn = null
+
+      try {
+        if (this.db.isOurs && this.db.opened && stop.destroy) {
+          await this.db.close()
+        }
+      } finally {
+        this.currentStop = null
+      }
+
+      this.emit(events.stopped)
+
+      // Reported only now, so a failed write still leaves a finished stop
+      if (failActiveError) {
+        throw failActiveError
+      }
+    }
+
+    const workersStopped = stopWorkers()
+
+    stop.promise = workersStopped.then(finish)
+    // Every caller reports a failed stop itself: by awaiting stop.promise, or as an error event below
+    stop.promise.catch(() => {})
+
+    await workersStopped
+
+    if (waits) {
+      await stop.promise
+    } else {
+      stop.promise.catch(err => this.emit(events.error, err))
+    }
   }
 }
 
