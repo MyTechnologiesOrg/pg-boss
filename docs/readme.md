@@ -451,7 +451,7 @@ Calling `stop()` while a stop is in progress doesn't start a second one. The cal
 
   * `graceful`, bool
 
-    Default: `true`. If `true`, the PgBoss instance will wait for any workers that are currently processing jobs to finish, up to the specified timeout. During this period, no new fetches start, but active jobs, including the jobs a fetch already in progress returns, will be allowed to finish.
+    Default: `true`. If `true`, the PgBoss instance will wait for any workers that are currently processing jobs to finish, up to the specified timeout. During this period, workers created by `work()` and `onComplete()` start no new fetches, but active jobs, including the jobs a fetch already in progress returns, will be allowed to finish. pg-boss's own maintenance and state monitoring workers keep running until those jobs finish or the timeout passes.
 
   * `timeout`, int
 
