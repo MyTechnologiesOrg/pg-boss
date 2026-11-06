@@ -189,6 +189,21 @@ describe('graceful stop', function () {
     assert(boss.stopped)
   })
 
+  it('should stop the maintenance worker again after a restart', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, noScheduling: true })
+
+    await boss.stop({ graceful: false })
+    await boss.start()
+
+    const [maintenance] = boss.manager.getWorkers().filter(worker => worker.name === '__pgboss__maintenance' && !worker.stopping && !worker.stopped)
+
+    assert(maintenance)
+
+    await boss.stop({ graceful: false })
+
+    assert(maintenance.stopping || maintenance.stopped)
+  })
+
   it('should let a later stop() with wait: true wait for the running stop', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
