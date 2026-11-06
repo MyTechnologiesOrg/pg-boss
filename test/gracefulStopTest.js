@@ -1,6 +1,8 @@
 const assert = require('assert')
 const delay = require('delay')
 const helper = require('./testHelper')
+const PgBoss = require('../')
+const { ATTEMPT_STARTED_ON } = require('../src/plans')
 
 describe('graceful stop', function () {
   const defaults = {
@@ -605,6 +607,32 @@ describe('graceful stop', function () {
     })
   }
 
+  it('should fail a maintenance job still running when failActive is true', async function () {
+    const schema = this.test.bossConfig.schema
+    const boss = this.test.boss = new PgBoss({ ...this.test.bossConfig, noScheduling: true })
+
+    boss.on('error', err => console.log({ schema, message: err.message }))
+
+    // Holds the maintenance handler in its first statement
+    const archiving = holdStatement(boss, text => text === boss.boss.archiveCommand, { before: true })
+
+    await boss.start()
+    await archiving.reached
+
+    const { rows } = await helper.findJobs(schema, 'name = $1 AND state = $2', ['__pgboss__maintenance', 'active'])
+
+    assert.strictEqual(rows.length, 1)
+
+    await boss.stop({ graceful: false, failActive: true })
+
+    const job = await helper.getJobById(schema, rows[0].id)
+
+    assert.strictEqual(job.state, 'failed')
+    assert.strictEqual(job.output.message, 'pg-boss stopped before the job finished')
+
+    archiving.open()
+  })
+
   it('should fail the other jobs when failing one of them fails and failActive is true', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const schema = this.test.bossConfig.schema
@@ -819,6 +847,50 @@ describe('graceful stop', function () {
       assert.strictEqual(job.output, null)
     })
   }
+
+  for (const batchOptions of [{}, { batchSize: 2 }]) {
+    it(`should keep the attempt it tracks off the jobs a handler sees${batchOptions.batchSize ? ' in batch mode' : ''}`, async function () {
+      const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+      const queue = this.test.bossConfig.schema
+
+      await boss.send(queue)
+
+      let seen = null
+
+      await boss.work(queue, { includeMetadata: true, newJobCheckInterval: 100, ...batchOptions }, async (value) => {
+        seen = [].concat(value)
+      })
+
+      await waitFor(() => seen)
+
+      for (const job of seen) {
+        assert(job.startedon)
+        assert(!(ATTEMPT_STARTED_ON in job))
+      }
+    })
+  }
+
+  it('should let go of the jobs of a worker whose onFetch throws', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults, __test__throw_worker: true })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    const errored = new Promise(resolve => boss.once('error', resolve))
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {})
+    await errored
+
+    assert.deepStrictEqual(boss.manager.getWipData(), [])
+
+    const [worker] = boss.manager.getWorkers()
+    const stopStartedOn = Date.now()
+
+    await boss.stop({ timeout: 8000, wait: true })
+
+    assert(Date.now() - stopStartedOn < 4000, `stopped after ${Date.now() - stopStartedOn}ms`)
+    assert(worker.stopped)
+  })
 
   const batchChanges = {
     replaces: jobs => {
