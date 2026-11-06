@@ -17,6 +17,9 @@ class Worker {
     this.onError = onError
     this.interval = interval
     this.jobs = []
+    // jobs fetched and not yet completed or failed, which outlive onFetch() in teamRefill mode
+    this.inFlight = new Set()
+    this.fetching = false
     this.createdOn = Date.now()
     this.lastFetchedOn = null
     this.lastJobStartedOn = null
@@ -84,6 +87,20 @@ class Worker {
     this.stopping = false
     this.stopped = true
     this.state = WORKER_STATES.stopped
+  }
+
+  hasPendingWork () {
+    if (this.fetching) {
+      return true
+    }
+
+    for (const attempt of this.inFlight) {
+      if (!attempt.abandoned) {
+        return true
+      }
+    }
+
+    return false
   }
 
   stop () {

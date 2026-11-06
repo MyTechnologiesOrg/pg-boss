@@ -438,7 +438,9 @@ One example of how this is useful would be including `start()` inside the bootst
 
 All job monitoring will be stopped and all workers on this instance will be removed. Basically, it's the opposite of `start()`. Even though `start()` may create new database objects during initialization, `stop()` will never remove anything from the database.
 
-By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event.
+By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. Jobs still running in `teamRefill` workers and jobs returned by a fetch that was in flight when `stop()` was called are waited for too, including the write that completes or fails them. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event.
+
+If a stop fails, the instance stays running and `stop()` can be called again.
 
 **Arguments**
 

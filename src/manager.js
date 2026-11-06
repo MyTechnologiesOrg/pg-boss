@@ -14,7 +14,7 @@ const { QUEUES: TIMEKEEPER_QUEUES } = require('./timekeeper')
 const INTERNAL_QUEUES = Object.values(BOSS_QUEUES).concat(Object.values(TIMEKEEPER_QUEUES)).reduce((acc, i) => ({ ...acc, [i]: i }), {})
 
 const plans = require('./plans')
-const { COMPLETION_JOB_PREFIX, SINGLETON_QUEUE_KEY } = plans
+const { COMPLETION_JOB_PREFIX, SINGLETON_QUEUE_KEY, ATTEMPT_COLUMN } = plans
 
 const WIP_EVENT_INTERVAL = 2000
 const WIP_DEBOUNCE_OPTIONS = { leading: true, trailing: true, maxWait: WIP_EVENT_INTERVAL }
@@ -74,9 +74,11 @@ class Manager extends EventEmitter {
     this.insertJobCommand = plans.insertJob(config.schema)
     this.insertJobsCommand = plans.insertJobs(config.schema)
     this.completeJobsCommand = plans.completeJobs(config.schema)
+    this.completeAttemptsCommand = plans.completeAttempts(config.schema)
     this.cancelJobsCommand = plans.cancelJobs(config.schema)
     this.resumeJobsCommand = plans.resumeJobs(config.schema)
     this.failJobsCommand = plans.failJobs(config.schema)
+    this.failAttemptsCommand = plans.failAttempts(config.schema)
     this.getJobByIdCommand = plans.getJobById(config.schema)
     this.getArchivedJobByIdCommand = plans.getArchivedJobById(config.schema)
     this.subscribeCommand = plans.subscribe(config.schema)
@@ -167,7 +169,7 @@ class Manager extends EventEmitter {
         name,
         options,
         state,
-        jobs,
+        inFlight,
         createdOn,
         lastFetchedOn,
         lastJobStartedOn,
@@ -179,7 +181,7 @@ class Manager extends EventEmitter {
         name,
         options,
         state,
-        count: jobs.length,
+        count: inFlight.size,
         createdOn,
         lastFetchedOn,
         lastJobStartedOn,
@@ -190,6 +192,31 @@ class Manager extends EventEmitter {
       .filter(i => i.count > 0 && (!INTERNAL_QUEUES[i.name] || includeInternal))
 
     return data
+  }
+
+  hasPendingWork (options = {}) {
+    const { includeInternal = false } = options
+
+    return this.getWorkers().some(worker => (includeInternal || !INTERNAL_QUEUES[worker.name]) && worker.hasPendingWork())
+  }
+
+  async completeAttempts (attempts, data) {
+    return await this.settleAttempts(this.completeAttemptsCommand, attempts.filter(i => !i.abandoned), data)
+  }
+
+  async failAttempts (attempts, data) {
+    return await this.settleAttempts(this.failAttemptsCommand, attempts.filter(i => !i.abandoned), data)
+  }
+
+  async settleAttempts (command, attempts, data) {
+    if (attempts.length === 0) {
+      return
+    }
+
+    const ids = attempts.map(i => i.id)
+    const tokens = attempts.map(i => i.token)
+
+    await this.db.executeSql(command, [ids, this.mapCompletionDataArg(data), tokens])
   }
 
   async watch (name, options, callback) {
@@ -228,10 +255,60 @@ class Manager extends EventEmitter {
       createTeamRefillPromise()
     }
 
-    const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit })
+    const attempts = new WeakMap()
+
+    const fetch = async () => {
+      worker.fetching = true
+
+      try {
+        const jobs = await this.fetchJobs(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit }, false)
+
+        for (const job of jobs || []) {
+          const attempt = { id: job.id, token: job[ATTEMPT_COLUMN], abandoned: false }
+          delete job[ATTEMPT_COLUMN]
+          attempts.set(job, attempt)
+          worker.inFlight.add(attempt)
+        }
+
+        return jobs
+      } finally {
+        worker.fetching = false
+      }
+    }
+
+    const release = (jobs) => {
+      for (const job of jobs) {
+        worker.inFlight.delete(attempts.get(job))
+      }
+    }
+
+    // stays tracked until the completion write settles, so a graceful stop waits for it
+    const settle = async (jobs, run, seconds) => {
+      const held = jobs.map(job => attempts.get(job))
+
+      try {
+        let result
+
+        try {
+          result = await resolveWithinSeconds(run(), seconds)
+        } catch (err) {
+          await this.failAttempts(held, err)
+          return
+        }
+
+        try {
+          await this.completeAttempts(held, result)
+        } catch (err) {
+          await this.failAttempts(held, err)
+        }
+      } finally {
+        release(jobs)
+      }
+    }
 
     const onFetch = async (jobs) => {
       if (this.config.__test__throw_worker) {
+        release(jobs)
         throw new Error('__test__throw_worker')
       }
 
@@ -240,21 +317,21 @@ class Manager extends EventEmitter {
       if (batchSize) {
         const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expire_in_seconds), 0)
 
-        await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          .then(() => this.complete(jobs.map(job => job.id)))
-          .catch(err => this.fail(jobs.map(job => job.id), err))
+        await settle(jobs, async () => { await callback(jobs) }, maxExpiration)
       } else {
         if (refill) {
           queueSize += jobs.length || 1
         }
 
-        const allTeamPromise = pMap(jobs, job =>
-          resolveWithinSeconds(callback(job), job.expire_in_seconds)
-            .then(result => this.complete(job.id, result))
-            .catch(err => this.fail(job.id, err))
-            .then(() => refill ? onRefill() : null)
-        , { concurrency: teamConcurrency }
-        ).catch(() => {}) // allow promises & non-promises to live together in harmony
+        const allTeamPromise = pMap(jobs, async job => {
+          try {
+            await settle([job], async () => await callback(job), job.expire_in_seconds)
+          } catch {}
+
+          if (refill) {
+            onRefill()
+          }
+        }, { concurrency: teamConcurrency })
 
         if (refill) {
           if (queueSize < teamSize) {
@@ -305,7 +382,7 @@ class Manager extends EventEmitter {
     }
 
     setImmediate(async () => {
-      while (!workers.every(w => w.stopped)) {
+      while (!workers.every(w => w.stopped && !w.hasPendingWork())) {
         await delay(1000)
       }
 
@@ -492,6 +569,10 @@ class Manager extends EventEmitter {
   }
 
   async fetch (name, batchSize, options = {}) {
+    return await this.fetchJobs(name, batchSize, options, true)
+  }
+
+  async fetchJobs (name, batchSize, options, stripAttempt) {
     const values = Attorney.checkFetchArgs(name, batchSize, options)
     const db = options.db || this.db
     const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false)
@@ -507,6 +588,12 @@ class Manager extends EventEmitter {
 
     if (!result || result.rows.length === 0) {
       return null
+    }
+
+    if (stripAttempt) {
+      for (const row of result.rows) {
+        delete row[ATTEMPT_COLUMN]
+      }
     }
 
     return result.rows.length === 1 && !batchSize ? result.rows[0] : result.rows

@@ -49,6 +49,8 @@ class Boss extends EventEmitter {
   }
 
   async supervise () {
+    this.stopped = false
+
     this.metaMonitor()
 
     await this.manager.deleteQueue(COMPLETION_JOB_PREFIX + queues.MAINTENANCE)

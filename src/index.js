@@ -131,32 +131,40 @@ class PgBoss extends EventEmitter {
 
     this.stoppingOn = Date.now()
 
-    await this.manager.stop()
-    await this.timekeeper.stop()
+    let halted = false
 
-    const shutdown = async () => {
-      this.stopped = true
-      this.stoppingOn = null
+    const halting = (async () => {
+      await this.manager.stop()
+      await this.timekeeper.stop()
+      halted = true
+    })()
 
-      if (this.db.isOurs && this.db.opened && destroy) {
-        await this.db.close()
-      }
-
-      this.emit(events.stopped)
-    }
+    const stopping = this.stopping = this.finishStop({ halting, destroy, graceful, timeout })
 
     if (!graceful) {
-      await this.boss.stop()
-      await shutdown()
+      await stopping
       return
     }
 
-    setImmediate(async () => {
-      let closing = false
+    // the caller sees a failure to stop the workers; anything later can only be reported as an event
+    stopping.catch(err => {
+      if (halted) {
+        this.emit(events.error, err)
+      }
+    })
 
-      try {
+    await halting
+  }
+
+  async finishStop ({ halting, destroy, graceful, timeout }) {
+    try {
+      await halting
+
+      if (graceful) {
+        let closing = false
+
         while (Date.now() - this.stoppingOn < timeout) {
-          if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
+          if (!this.manager.hasPendingWork({ includeInternal: closing })) {
             if (closing) {
               break
             }
@@ -168,13 +176,22 @@ class PgBoss extends EventEmitter {
 
           await delay(1000)
         }
-
-        await this.boss.stop()
-        await shutdown()
-      } catch (err) {
-        this.emit(events.error, err)
       }
-    })
+
+      await this.boss.stop()
+    } catch (err) {
+      this.stoppingOn = null
+      throw err
+    }
+
+    this.stopped = true
+    this.stoppingOn = null
+
+    if (this.db.isOurs && this.db.opened && destroy) {
+      await this.db.close()
+    }
+
+    this.emit(events.stopped)
   }
 }
 

@@ -15,6 +15,10 @@ const COMPLETION_JOB_PREFIX = `__state__${states.completed}__`
 const SINGLETON_QUEUE_KEY = '__pgboss__singleton_queue'
 const SINGLETON_QUEUE_KEY_ESCAPED = SINGLETON_QUEUE_KEY.replace(/[\\%_]/g, '\\$&')
 
+// Identifies one fetch of a job: startedOn is reset on every fetch, retries included
+const ATTEMPT_COLUMN = 'pgboss_attempt'
+const attemptOf = (startedOn) => `(EXTRACT(epoch FROM ${startedOn}) * 1000000)::bigint`
+
 const MIGRATE_RACE_MESSAGE = 'division by zero'
 const CREATE_RACE_MESSAGE = 'already exists'
 
@@ -26,9 +30,11 @@ module.exports = {
   versionTableExists,
   fetchNextJob,
   completeJobs,
+  completeAttempts,
   cancelJobs,
   resumeJobs,
   failJobs,
+  failAttempts,
   insertJob,
   insertJobs,
   getTime,
@@ -57,6 +63,7 @@ module.exports = {
   states: { ...states },
   COMPLETION_JOB_PREFIX,
   SINGLETON_QUEUE_KEY,
+  ATTEMPT_COLUMN,
   MIGRATE_RACE_MESSAGE,
   CREATE_RACE_MESSAGE,
   DEFAULT_SCHEMA
@@ -386,7 +393,8 @@ function fetchNextJob (schema) {
       retryCount = CASE WHEN state = '${states.retry}' THEN retryCount + 1 ELSE retryCount END
     FROM nextJob
     WHERE j.id = nextJob.id
-    RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds
+    RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds,
+      ${attemptOf('j.startedOn')} as ${ATTEMPT_COLUMN}
   `
 }
 
@@ -424,14 +432,27 @@ const retryStartAfterCase = `CASE
 
 const keepUntilInheritance = 'keepUntil + (keepUntil - startAfter)'
 
+const byIds = 'id IN (SELECT UNNEST($1::uuid[]))'
+
+// $3 carries the attempt each id was fetched as, so a late write can't land on a newer attempt
+const byAttempts = (alias = '') => `(${alias}id, ${attemptOf(`${alias}startedOn`)}) IN (SELECT * FROM UNNEST($1::uuid[], $3::bigint[]))`
+
 function completeJobs (schema) {
+  return completeJobsWhere(schema, byIds)
+}
+
+function completeAttempts (schema) {
+  return completeJobsWhere(schema, byAttempts())
+}
+
+function completeJobsWhere (schema, where) {
   return `
     WITH results AS (
       UPDATE ${schema}.job
       SET completedOn = now(),
         state = '${states.completed}',
         output = $2::jsonb
-      WHERE id IN (SELECT UNNEST($1::uuid[]))
+      WHERE ${where}
         AND state = '${states.active}'
       RETURNING *
     ), completion_jobs as (
@@ -482,7 +503,16 @@ function retryCandidates (schema, where) {
 }
 
 function failJobs (schema) {
-  const where = `id IN (SELECT UNNEST($1::uuid[]))
+  return failJobsWhere(schema, byIds)
+}
+
+function failAttempts (schema) {
+  return failJobsWhere(schema, byAttempts('j.'), byAttempts('j.'))
+}
+
+// recheck is repeated on the UPDATE so a row retried and refetched since the snapshot is rechecked
+function failJobsWhere (schema, match, recheck) {
+  const where = `${match}
         AND state < '${states.completed}'`
 
   return `
@@ -500,6 +530,7 @@ function failJobs (schema) {
       FROM candidates c
       WHERE j.id = c.id
         AND j.state < '${states.completed}'
+        ${recheck ? `AND ${recheck}` : ''}
       RETURNING j.*
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)
