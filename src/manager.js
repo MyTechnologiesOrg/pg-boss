@@ -652,8 +652,13 @@ class Manager extends EventEmitter {
 
     jobs.push(...workers.flatMap(worker => worker.release()))
 
-    if (jobs.length > 0) {
-      await this.failAttempts(jobs, new Error('pg-boss stopped before the job finished'))
+    try {
+      if (jobs.length > 0) {
+        await this.failAttempts(jobs, new Error('pg-boss stopped before the job finished'))
+      }
+    } finally {
+      // release() left the results being recorded, and those writes must land before the pool closes
+      await Promise.all(workers.map(worker => worker.recorded()))
     }
   }
 

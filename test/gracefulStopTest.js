@@ -305,11 +305,18 @@ describe('graceful stop', function () {
 
     await completing.reached
 
-    await boss.stop({ graceful: false, failActive: true })
+    let stopped = false
+    const stopping = boss.stop({ graceful: false, failActive: true, destroy: true }).then(() => { stopped = true })
+
+    await delay(300)
+
+    assert.strictEqual(stopped, false)
 
     completing.open()
+    await stopping
 
-    await waitFor(async () => (await helper.getJobById(schema, jobId)).state === 'completed')
+    assert.strictEqual((await helper.getJobById(schema, jobId)).state, 'completed')
+    assert.strictEqual(boss.db.opened, false)
   })
 
   it('should fail jobs from a fetch still in flight when failActive is true', async function () {

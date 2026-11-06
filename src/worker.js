@@ -32,7 +32,7 @@ class Worker {
     this.fetchInFlight = false
     this.settling = new Set()
     this.released = false
-    this.onJobsRemoved = null
+    this.jobsRemoved = []
   }
 
   // Jobs are tracked as soon as their fetch returns, so stop() can find them before onFetch runs
@@ -70,8 +70,23 @@ class Worker {
       this.settling.delete(job)
     }
 
-    if (this.onJobsRemoved) {
-      this.onJobsRemoved()
+    const waiting = this.jobsRemoved
+
+    this.jobsRemoved = []
+
+    for (const resolve of waiting) {
+      resolve()
+    }
+  }
+
+  async jobRemoved () {
+    await new Promise(resolve => { this.jobsRemoved.push(resolve) })
+  }
+
+  // Resolves once the results this worker started recording have been written
+  async recorded () {
+    while (this.settling.size > 0) {
+      await this.jobRemoved()
     }
   }
 
@@ -151,7 +166,7 @@ class Worker {
     // A teamRefill worker leaves the loop while jobs it fetched are still running, and a released
     // worker may still hold jobs that stop() is about to fail
     while (this.jobs.length > 0) {
-      await new Promise(resolve => { this.onJobsRemoved = resolve })
+      await this.jobRemoved()
     }
 
     this.stopping = false
