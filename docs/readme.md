@@ -438,7 +438,9 @@ One example of how this is useful would be including `start()` inside the bootst
 
 All job monitoring will be stopped and all workers on this instance will be removed. Basically, it's the opposite of `start()`. Even though `start()` may create new database objects during initialization, `stop()` will never remove anything from the database.
 
-By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event.
+By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs, including the jobs a fetch still in progress returns, before closing the internal connection pool and stopping maintenance operations. A job counts as finished once pg-boss has tried to record its result. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is `true`.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
+
+Calling `stop()` while a stop is in progress doesn't start a second one. The call joins the running stop, which then stops waiting at the earlier of the two deadlines (straight away if the later call has `graceful: false`). The running stop also closes the pool or fails active jobs if the later call asks for it and the stop hasn't passed that step yet. Like a first call, the later call resolves once the stop has finished if it has `wait: true` or `graceful: false`, and straight away otherwise. A stop that has failed is no longer in progress, so the next `stop()` starts a new one.
 
 **Arguments**
 
@@ -449,11 +451,23 @@ By default, calling `stop()` without any arguments will gracefully wait for all 
 
   * `graceful`, bool
 
-    Default: `true`. If `true`, the PgBoss instance will wait for any workers that are currently processing jobs to finish, up to the specified timeout. During this period, new jobs will not be processed, but active jobs will be allowed to finish.
+    Default: `true`. If `true`, the PgBoss instance will wait for any workers that are currently processing jobs to finish, up to the specified timeout. During this period, workers created by `work()` and `onComplete()` start no new fetches, but active jobs, including the jobs a fetch already in progress returns, will be allowed to finish. pg-boss's own maintenance and state monitoring workers keep running until those jobs finish or the timeout passes.
 
   * `timeout`, int
 
     Default: 30000. Maximum time (in milliseconds) to wait for workers to finish job processing before shutting down the PgBoss instance.
+
+  * `wait`, bool
+
+    Default: `false`. If `true`, the promise returned by a graceful `stop()` resolves once the stop has finished, after `stopped` is emitted, and rejects if the stop fails instead of emitting `error`.
+
+  * `failActive`, bool
+
+    Default: `false`. If `true`, jobs this instance's workers still hold when `stop()` stops waiting for them (once `timeout` passes, or straight away when `graceful` is `false`) are failed before the connection pool is closed. They then retry according to their retry options instead of staying `active` until they expire. This covers the jobs of every `work()` and `onComplete()` worker on this instance, pg-boss's own maintenance and cron workers included, and the jobs a fetch still in progress returns. It doesn't cover jobs taken with `fetch()`.
+
+    Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. A job whose handler has already finished keeps the result its worker is recording, and `stop()` waits for that write before closing the pool. Handlers that are still running are not interrupted, and their results are not recorded. Team jobs still waiting for a free slot (see `teamConcurrency`) are failed too, and their handlers never start. These writes come after the wait that `timeout` limits and have no timeout of their own, so a slow database can make `stop()` take longer than `timeout`.
+
+    If failing a job fails, as it can for a singleton queue job that `fail()` would also throw for (see `useSingletonQueue`), the other jobs are still failed and the stop still finishes: `stopped` is emitted and, with `destroy`, the pool is closed. The first error is reported afterwards: every `stop()` call that waits for the stop rejects with it, and only if none does is it emitted as an `error` event. Calling `stop()` again won't fail that job, since the stop that released it has finished.
 
 
 ## `send()`

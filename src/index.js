@@ -53,6 +53,7 @@ class PgBoss extends EventEmitter {
     manager.timekeeper = timekeeper
 
     this.stoppingOn = null
+    this.currentStop = null
     this.stopped = true
     this.config = config
     this.db = db
@@ -117,7 +118,27 @@ class PgBoss extends EventEmitter {
   }
 
   async stop (options = {}) {
-    if (this.stoppingOn) {
+    const { destroy = false, graceful = true, timeout = 30000, wait = false, failActive = false } = options
+    const deadline = Date.now() + (graceful ? Math.max(timeout, 1000) : 0)
+    const waits = wait || !graceful
+
+    if (this.currentStop) {
+      // A stop() made while another is running joins it: the earlier deadline wins, and destroy and failActive add up
+      const stop = this.currentStop
+
+      stop.deadline = Math.min(stop.deadline, deadline)
+      stop.destroy = stop.destroy || destroy
+      stop.failActive = stop.failActive || failActive
+
+      if (stop.sleep) {
+        stop.sleep.clear()
+      }
+
+      if (waits) {
+        stop.awaited = true
+        await stop.promise
+      }
+
       return
     }
 
@@ -125,56 +146,89 @@ class PgBoss extends EventEmitter {
       this.emit(events.stopped)
     }
 
-    let { destroy = false, graceful = true, timeout = 30000 } = options
-
-    timeout = Math.max(timeout, 1000)
-
     this.stoppingOn = Date.now()
 
-    await this.manager.stop()
-    await this.timekeeper.stop()
+    const stop = this.currentStop = { deadline, destroy, failActive, sleep: null, awaited: waits }
 
-    const shutdown = async () => {
+    const stopWorkers = async () => {
+      await this.manager.stop()
+      await this.timekeeper.stop()
+    }
+
+    const finish = async () => {
+      let closing = false
+
+      while (Date.now() < stop.deadline) {
+        if (!this.manager.hasBusyWorkers({ includeInternal: closing })) {
+          if (closing) {
+            break
+          }
+
+          closing = true
+
+          await this.boss.stop()
+        }
+
+        // Capped at the deadline, which a stop() that joins while this.boss.stop() runs may have moved
+        stop.sleep = delay(Math.max(0, Math.min(1000, stop.deadline - Date.now())))
+        await stop.sleep
+        stop.sleep = null
+      }
+
+      await this.boss.stop()
+
+      let failActiveError = null
+
+      if (stop.failActive) {
+        try {
+          await this.manager.failActiveJobs()
+        } catch (err) {
+          failActiveError = err
+        }
+      }
+
       this.stopped = true
       this.stoppingOn = null
 
-      if (this.db.isOurs && this.db.opened && destroy) {
-        await this.db.close()
+      try {
+        if (this.db.isOurs && this.db.opened && stop.destroy) {
+          await this.db.close()
+        }
+      } finally {
+        this.currentStop = null
       }
 
       this.emit(events.stopped)
+
+      // Reported only now, so a failed write still leaves a finished stop
+      if (failActiveError) {
+        throw failActiveError
+      }
     }
 
-    if (!graceful) {
-      await this.boss.stop()
-      await shutdown()
-      return
-    }
+    const workersStopped = stopWorkers()
 
-    setImmediate(async () => {
-      let closing = false
-
-      try {
-        while (Date.now() - this.stoppingOn < timeout) {
-          if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
-            if (closing) {
-              break
-            }
-
-            closing = true
-
-            await this.boss.stop()
-          }
-
-          await delay(1000)
-        }
-
-        await this.boss.stop()
-        await shutdown()
-      } catch (err) {
-        this.emit(events.error, err)
+    stop.promise = workersStopped.then(finish).finally(() => {
+      // A stop that failed before it finished is no longer running, so the next stop() starts a new one
+      if (this.currentStop === stop) {
+        this.currentStop = null
+        this.stoppingOn = null
       }
     })
+    // A failed stop rejects every call that waits for it, and is emitted as an error only if none does
+    stop.promise.catch(() => {})
+
+    await workersStopped
+
+    if (waits) {
+      await stop.promise
+    } else {
+      stop.promise.catch(err => {
+        if (!stop.awaited) {
+          this.emit(events.error, err)
+        }
+      })
+    }
   }
 }
 
