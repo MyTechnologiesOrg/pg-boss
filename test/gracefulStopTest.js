@@ -224,6 +224,39 @@ describe('graceful stop', function () {
     release()
   })
 
+  it('should return straight away from a later stop() without wait', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    await boss.stop({ timeout: 30000 })
+
+    const returned = await Promise.race([
+      boss.stop({ timeout: 20000 }).then(() => true),
+      delay(500).then(() => false)
+    ])
+
+    assert(returned)
+    assert.strictEqual(boss.stopped, false)
+
+    release()
+
+    await boss.stop({ wait: true })
+
+    assert(boss.stopped)
+  })
+
   it('should stop at the deadline of a later stop() that joins while the supervisor is stopping', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
 
@@ -317,7 +350,43 @@ describe('graceful stop', function () {
     assert.deepStrictEqual(await getStates(this.test.bossConfig.schema, queue), ['retry', 'retry', 'retry'])
   })
 
-  it('should fail the jobs of a teamRefill worker when failActive is true', async function () {
+  it('should run the rest of a team when recording a failure fails', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    await boss.send(queue)
+    await boss.send(queue)
+
+    const executeSql = boss.db.executeSql.bind(boss.db)
+    let failWrites = 0
+
+    boss.db.executeSql = async (text, values) => {
+      if (text === boss.manager.failActiveAttemptsCommand && failWrites++ === 0) {
+        throw new Error('fail write failed')
+      }
+
+      return await executeSql(text, values)
+    }
+
+    const startedIds = []
+
+    await boss.work(queue, { teamSize: 2, teamConcurrency: 1, newJobCheckInterval: 100 }, async (job) => {
+      startedIds.push(job.id)
+
+      if (startedIds.length === 1) {
+        throw new Error('handler failed')
+      }
+    })
+
+    await waitFor(() => startedIds.length === 2)
+    await waitFor(() => boss.manager.getWipData().length === 0)
+
+    assert.strictEqual((await helper.getJobById(schema, startedIds[0])).state, 'active')
+    assert.strictEqual((await helper.getJobById(schema, startedIds[1])).state, 'completed')
+  })
+
+  it('should fail the running job of a teamRefill worker when failActive is true', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
     const schema = this.test.bossConfig.schema
@@ -325,26 +394,27 @@ describe('graceful stop', function () {
     await boss.send(queue, null, { retryLimit: 1, retryDelay: 60 })
     await boss.send(queue, null, { retryLimit: 1, retryDelay: 60 })
 
-    let started = 0
+    const startedIds = []
     let release
     const released = new Promise(resolve => { release = resolve })
 
-    await boss.work(queue, { teamSize: 2, teamConcurrency: 1, teamRefill: true, newJobCheckInterval: 100 }, async () => {
-      started++
-      await released
+    await boss.work(queue, { teamSize: 2, teamConcurrency: 1, teamRefill: true, newJobCheckInterval: 100 }, async (job) => {
+      startedIds.push(job.id)
+
+      if (startedIds.length > 1) {
+        await released
+      }
     })
 
-    await waitFor(() => started === 1)
+    // The first job's completion is recorded, so onFetch has returned while the second job runs
+    await waitFor(() => startedIds.length === 2)
 
     await boss.stop({ graceful: false, failActive: true })
 
-    assert.deepStrictEqual(await getStates(schema, queue), ['retry', 'retry'])
+    assert.strictEqual((await helper.getJobById(schema, startedIds[0])).state, 'completed')
+    assert.strictEqual((await helper.getJobById(schema, startedIds[1])).state, 'retry')
 
     release()
-    await delay(500)
-
-    assert.strictEqual(started, 1)
-    assert.deepStrictEqual(await getStates(schema, queue), ['retry', 'retry'])
   })
 
   it('should fail the jobs of an onComplete() worker when failActive is true', async function () {
@@ -500,8 +570,9 @@ describe('graceful stop', function () {
   it('should finish the stop before reporting a failActive error', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
 
-    await boss.send(queue)
+    const jobId = await boss.send(queue)
 
     let release
     let started = false
@@ -523,6 +594,46 @@ describe('graceful stop', function () {
 
     assert(stoppedEmitted)
     assert(boss.stopped)
+
+    release()
+    await delay(500)
+
+    // stop() took the job, so its handler's result isn't recorded even though failing the job failed
+    const job = await helper.getJobById(schema, jobId)
+
+    assert.strictEqual(job.state, 'active')
+    assert.strictEqual(job.output, null)
+  })
+
+  it('should emit a failActive error once from a graceful stop() without wait', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    failFailActiveWrites(boss)
+
+    const errors = []
+
+    boss.on('error', err => errors.push(err.message))
+
+    const stopped = new Promise(resolve => boss.once('stopped', resolve))
+
+    await boss.stop({ timeout: 1000, failActive: true })
+    await stopped
+    await delay(100)
+
+    assert.deepStrictEqual(errors, ['fail write failed'])
 
     release()
   })
@@ -632,23 +743,40 @@ describe('graceful stop', function () {
     })
   }
 
-  it('should record the results of a batch whose handler replaces its jobs', async function () {
-    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
-    const queue = this.test.bossConfig.schema
-    const schema = this.test.bossConfig.schema
-
-    await boss.send(queue)
-    await boss.send(queue)
-
-    await boss.work(queue, { batchSize: 2, newJobCheckInterval: 100 }, async (jobs) => {
+  const batchChanges = {
+    replaces: jobs => {
       for (let i = 0; i < jobs.length; i++) {
         jobs[i] = { ...jobs[i] }
       }
-    })
+    },
+    empties: jobs => {
+      jobs.length = 0
+    }
+  }
 
-    await waitFor(async () => (await getStates(schema, queue)).join() === 'completed,completed')
-    await waitFor(() => boss.manager.getWipData().length === 0)
-  })
+  for (const [change, changeJobs] of Object.entries(batchChanges)) {
+    it(`should record the results of a batch whose handler ${change} its jobs`, async function () {
+      const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+      const queue = this.test.bossConfig.schema
+      const schema = this.test.bossConfig.schema
+
+      await boss.send(queue)
+      await boss.send(queue)
+
+      const errors = []
+
+      boss.on('error', err => errors.push(err.message))
+
+      await boss.work(queue, { batchSize: 2, newJobCheckInterval: 100 }, async (jobs) => {
+        changeJobs(jobs)
+      })
+
+      await waitFor(async () => (await getStates(schema, queue)).join() === 'completed,completed')
+      await waitFor(() => boss.manager.getWipData().length === 0)
+
+      assert.deepStrictEqual(errors, [])
+    })
+  }
 
   for (const batchOptions of [{}, { batchSize: 2 }]) {
     it(`should fail the job of a handler that throws synchronously${batchOptions.batchSize ? ' in batch mode' : ''}`, async function () {
