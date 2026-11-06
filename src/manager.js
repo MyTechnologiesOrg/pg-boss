@@ -200,6 +200,23 @@ class Manager extends EventEmitter {
     return this.getWorkers().some(worker => (includeInternal || !INTERNAL_QUEUES[worker.name]) && worker.hasPendingWork())
   }
 
+  async failHeldJobs (error) {
+    const attempts = []
+
+    for (const worker of this.getWorkers()) {
+      for (const attempt of worker.inFlight) {
+        if (!attempt.abandoned) {
+          attempt.abandoned = true
+          attempts.push(attempt)
+        }
+      }
+    }
+
+    await this.settleAttempts(this.failAttemptsCommand, attempts, error)
+
+    return attempts.length
+  }
+
   async completeAttempts (attempts, data) {
     return await this.settleAttempts(this.completeAttemptsCommand, attempts.filter(i => !i.abandoned), data)
   }

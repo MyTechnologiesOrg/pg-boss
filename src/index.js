@@ -117,7 +117,13 @@ class PgBoss extends EventEmitter {
   }
 
   async stop (options = {}) {
+    const { wait = false } = options
+
     if (this.stoppingOn) {
+      if (wait) {
+        await this.stopping
+      }
+
       return
     }
 
@@ -125,7 +131,7 @@ class PgBoss extends EventEmitter {
       this.emit(events.stopped)
     }
 
-    let { destroy = false, graceful = true, timeout = 30000 } = options
+    let { destroy = false, graceful = true, timeout = 30000, failActive = false } = options
 
     timeout = Math.max(timeout, 1000)
 
@@ -139,9 +145,9 @@ class PgBoss extends EventEmitter {
       halted = true
     })()
 
-    const stopping = this.stopping = this.finishStop({ halting, destroy, graceful, timeout })
+    const stopping = this.stopping = this.finishStop({ halting, destroy, graceful, timeout, failActive })
 
-    if (!graceful) {
+    if (wait || !graceful) {
       await stopping
       return
     }
@@ -156,7 +162,7 @@ class PgBoss extends EventEmitter {
     await halting
   }
 
-  async finishStop ({ halting, destroy, graceful, timeout }) {
+  async finishStop ({ halting, destroy, graceful, timeout, failActive }) {
     try {
       await halting
 
@@ -179,6 +185,14 @@ class PgBoss extends EventEmitter {
       }
 
       await this.boss.stop()
+
+      if (failActive && this.manager.hasPendingWork({ includeInternal: true })) {
+        try {
+          await this.manager.failHeldJobs(new Error('pg-boss stopped before this job finished'))
+        } catch (err) {
+          this.emit(events.error, err)
+        }
+      }
     } catch (err) {
       this.stoppingOn = null
       throw err

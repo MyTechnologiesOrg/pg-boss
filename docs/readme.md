@@ -438,7 +438,7 @@ One example of how this is useful would be including `start()` inside the bootst
 
 All job monitoring will be stopped and all workers on this instance will be removed. Basically, it's the opposite of `start()`. Even though `start()` may create new database objects during initialization, `stop()` will never remove anything from the database.
 
-By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. Jobs still running in `teamRefill` workers and jobs returned by a fetch that was in flight when `stop()` was called are waited for too, including the write that completes or fails them. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event.
+By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. Jobs still running in `teamRefill` workers and jobs returned by a fetch that was in flight when `stop()` was called are waited for too, including the write that completes or fails them. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is set.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
 
 If a stop fails, the instance stays running and `stop()` can be called again.
 
@@ -456,6 +456,14 @@ If a stop fails, the instance stays running and `stop()` can be called again.
   * `timeout`, int
 
     Default: 30000. Maximum time (in milliseconds) to wait for workers to finish job processing before shutting down the PgBoss instance.
+
+  * `wait`, bool
+
+    Default: `false`. If `true`, the promise returned by `stop()` resolves after `stopped` is emitted and rejects if the stop fails, instead of the failure being emitted as an `error` event. Calling `stop({ wait: true })` while a stop is already in progress waits for that stop.
+
+  * `failActive`, bool
+
+    Default: `false`. If `true`, jobs this instance's workers still hold when the stop gives up (the graceful `timeout` passes, or immediately when `graceful` is `false`) are failed, so they are retried according to their retry options instead of staying `active` until they expire. A handler that finishes after this no longer completes or fails the job.
 
 
 ## `send()`

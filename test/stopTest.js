@@ -282,4 +282,116 @@ describe('stop', function () {
     await stop()
     assert.strictEqual(activeMaintenanceWorkers().length, 0)
   })
+
+  it('stop({ wait: true }) resolves after stopped is emitted', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue)
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => delay(1500))
+
+    await waitFor(async () => await getState(queue, jobId) === 'active')
+
+    let stoppedEmitted = false
+    boss.once('stopped', () => { stoppedEmitted = true })
+
+    await boss.stop({ wait: true, timeout: 10000 })
+
+    assert.strictEqual(stoppedEmitted, true)
+    assert.strictEqual(await getState(queue, jobId), 'completed')
+  })
+
+  it('stop({ wait: true }) rejects when the stop fails', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+
+    const bossStop = boss.boss.stop
+    boss.boss.stop = async () => {
+      boss.boss.stop = bossStop
+      throw new Error('stop failed')
+    }
+
+    let errorEmitted = false
+    boss.once('error', () => { errorEmitted = true })
+
+    await assert.rejects(boss.stop({ wait: true, timeout: 1000 }), /stop failed/)
+
+    assert.strictEqual(errorEmitted, false)
+  })
+
+  it('a second stop({ wait: true }) waits for the stop already in progress', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue)
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => delay(1500))
+
+    await waitFor(async () => await getState(queue, jobId) === 'active')
+
+    let stoppedEmitted = false
+    boss.once('stopped', () => { stoppedEmitted = true })
+
+    await boss.stop({ timeout: 10000 })
+    await boss.stop({ wait: true })
+
+    assert.strictEqual(stoppedEmitted, true)
+  })
+
+  it('stop({ failActive: true }) fails jobs still held when a graceful stop times out', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue, null, { retryLimit: 1 })
+
+    let finish
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => new Promise(resolve => { finish = resolve }))
+
+    await waitFor(async () => await getState(queue, jobId) === 'active')
+
+    await boss.stop({ wait: true, timeout: 1000, failActive: true })
+
+    const job = await helper.getJobById(queue, jobId)
+    assert.strictEqual(job.state, 'retry')
+    assert(job.output.message.includes('stop'))
+
+    finish()
+    await delay(200)
+
+    assert.strictEqual(await getState(queue, jobId), 'retry')
+  })
+
+  it('stop({ failActive: true, graceful: false }) fails jobs still held', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue)
+
+    await boss.work(queue, { teamSize: 2, teamRefill: true, newJobCheckInterval: 100 }, () => new Promise(() => {}))
+
+    await waitFor(async () => await getState(queue, jobId) === 'active')
+
+    await boss.stop({ graceful: false, failActive: true })
+
+    assert.strictEqual(await getState(queue, jobId), 'failed')
+  })
+
+  it('leaves held jobs active when a graceful stop times out without failActive', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue)
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => new Promise(() => {}))
+
+    await waitFor(async () => await getState(queue, jobId) === 'active')
+
+    const stopped = new Promise(resolve => boss.once('stopped', resolve))
+
+    await boss.stop({ timeout: 1000 })
+
+    await stopped
+
+    assert.strictEqual(await getState(queue, jobId), 'active')
+  })
 })
