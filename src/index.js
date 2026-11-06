@@ -135,6 +135,7 @@ class PgBoss extends EventEmitter {
       }
 
       if (waits) {
+        stop.awaited = true
         await stop.promise
       }
 
@@ -147,7 +148,7 @@ class PgBoss extends EventEmitter {
 
     this.stoppingOn = Date.now()
 
-    const stop = this.currentStop = { deadline, destroy, failActive, sleep: null }
+    const stop = this.currentStop = { deadline, destroy, failActive, sleep: null, awaited: waits }
 
     const stopWorkers = async () => {
       await this.manager.stop()
@@ -207,7 +208,7 @@ class PgBoss extends EventEmitter {
     const workersStopped = stopWorkers()
 
     stop.promise = workersStopped.then(finish)
-    // Every caller reports a failed stop itself: by awaiting stop.promise, or as an error event below
+    // A failed stop rejects every call that waits for it, and is emitted as an error only if none does
     stop.promise.catch(() => {})
 
     await workersStopped
@@ -215,7 +216,11 @@ class PgBoss extends EventEmitter {
     if (waits) {
       await stop.promise
     } else {
-      stop.promise.catch(err => this.emit(events.error, err))
+      stop.promise.catch(err => {
+        if (!stop.awaited) {
+          this.emit(events.error, err)
+        }
+      })
     }
   }
 }

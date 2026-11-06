@@ -467,7 +467,7 @@ Calling `stop()` while a stop is in progress doesn't start a second one. The cal
 
     Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. A job whose handler has already finished keeps the result its worker is recording, and `stop()` waits for that write before closing the pool. Handlers that are still running are not interrupted, and their results are not recorded. Team jobs still waiting for a free slot (see `teamConcurrency`) are failed too, and their handlers never start.
 
-    If failing the jobs fails, the stop still finishes: `stopped` is emitted and, with `destroy`, the pool is closed. The error is reported afterwards, by rejecting `stop()` if it waits for the stop, or as an `error` event otherwise. Calling `stop()` again won't fail those jobs, since the stop that released them has finished.
+    If failing the jobs fails, the stop still finishes: `stopped` is emitted and, with `destroy`, the pool is closed. The error is reported afterwards: every `stop()` call that waits for the stop rejects with it, and only if none does is it emitted as an `error` event. Calling `stop()` again won't fail those jobs, since the stop that released them has finished.
 
 
 ## `send()`

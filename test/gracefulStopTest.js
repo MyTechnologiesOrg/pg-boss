@@ -51,6 +51,18 @@ describe('graceful stop', function () {
     return rows.map(job => job.state)
   }
 
+  const failFailActiveWrites = (boss) => {
+    const executeSql = boss.db.executeSql.bind(boss.db)
+
+    boss.db.executeSql = async (text, values) => {
+      if (text === boss.manager.failActiveAttemptsCommand) {
+        throw new Error('fail write failed')
+      }
+
+      return await executeSql(text, values)
+    }
+  }
+
   it('should wait for teamRefill jobs still running', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
@@ -400,15 +412,7 @@ describe('graceful stop', function () {
 
     await waitFor(() => started)
 
-    const executeSql = boss.db.executeSql.bind(boss.db)
-
-    boss.db.executeSql = async (text, values) => {
-      if (text === boss.manager.failActiveAttemptsCommand) {
-        throw new Error('fail write failed')
-      }
-
-      return await executeSql(text, values)
-    }
+    failFailActiveWrites(boss)
 
     let stoppedEmitted = false
 
@@ -418,6 +422,39 @@ describe('graceful stop', function () {
 
     assert(stoppedEmitted)
     assert(boss.stopped)
+
+    release()
+  })
+
+  it('should report a failActive error only to a later stop() that waits for it', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    failFailActiveWrites(boss)
+
+    const errors = []
+
+    boss.on('error', err => errors.push(err.message))
+
+    await boss.stop({ timeout: 30000 })
+
+    await assert.rejects(boss.stop({ graceful: false, failActive: true }), { message: 'fail write failed' })
+
+    await delay(100)
+
+    assert.deepStrictEqual(errors, [])
 
     release()
   })
