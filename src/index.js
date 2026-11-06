@@ -158,7 +158,7 @@ class PgBoss extends EventEmitter {
       let closing = false
 
       while (Date.now() < stop.deadline) {
-        if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
+        if (!this.manager.hasBusyWorkers({ includeInternal: closing })) {
           if (closing) {
             break
           }

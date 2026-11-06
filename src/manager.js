@@ -198,6 +198,12 @@ class Manager extends EventEmitter {
     return data
   }
 
+  hasBusyWorkers (options = {}) {
+    const { includeInternal = false } = options
+
+    return this.getWorkers().some(worker => worker.isBusy() && (!INTERNAL_QUEUES[worker.name] || includeInternal))
+  }
+
   async watch (name, options, callback) {
     if (this.stopping) {
       throw new Error('Workers are disabled. pg-boss is stopping.')

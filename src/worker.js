@@ -29,6 +29,7 @@ class Worker {
     this.loopDelayPromise = null
     this.beenNotified = false
     this.fetching = null
+    this.fetchInFlight = false
     this.settling = new Set()
     this.released = false
     this.onJobsRemoved = null
@@ -36,19 +37,30 @@ class Worker {
 
   // Jobs are tracked as soon as their fetch returns, so stop() can find them before onFetch runs
   async fetchJobs () {
-    const jobs = await this.fetch()
+    this.fetchInFlight = true
 
-    if (jobs) {
-      this.jobs = this.jobs.concat(jobs)
+    try {
+      const jobs = await this.fetch()
+
+      if (jobs) {
+        this.jobs = this.jobs.concat(jobs)
+      }
+
+      return jobs
+    } finally {
+      this.fetchInFlight = false
     }
-
-    return jobs
   }
 
   async fetched () {
     try {
       await this.fetching
     } catch {}
+  }
+
+  // A fetch in flight counts, since the jobs it fetches are already active
+  isBusy () {
+    return this.fetchInFlight || this.jobs.length > 0
   }
 
   removeJobs (jobs) {

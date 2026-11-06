@@ -344,6 +344,39 @@ describe('graceful stop', function () {
     assert.strictEqual(started, false)
   })
 
+  for (const failActive of [false, true]) {
+    it(`should wait for a fetch still in flight during a graceful stop${failActive ? ' when failActive is true' : ''}`, async function () {
+      const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+      const queue = this.test.bossConfig.schema
+      const schema = this.test.bossConfig.schema
+
+      const jobId = await boss.send(queue)
+
+      const fetchCommand = boss.manager.nextJobCommand(false, false, true)
+      const fetching = holdStatement(boss, text => text === fetchCommand)
+
+      let started = false
+
+      await boss.work(queue, { newJobCheckInterval: 100 }, () => { started = true })
+
+      await fetching.reached
+
+      let stopped = false
+      const stopping = boss.stop({ timeout: 10000, wait: true, failActive }).then(() => { stopped = true })
+
+      // Past the stop's first two checks, a second apart
+      await delay(2500)
+
+      assert.strictEqual(stopped, false)
+
+      fetching.open()
+      await stopping
+
+      assert(started)
+      assert.strictEqual((await helper.getJobById(schema, jobId)).state, 'completed')
+    })
+  }
+
   it('should finish the stop before reporting a failActive error', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
