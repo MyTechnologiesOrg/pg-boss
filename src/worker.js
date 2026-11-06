@@ -8,7 +8,7 @@ const WORKER_STATES = {
 }
 
 class Worker {
-  constructor ({ id, name, options, interval, fetch, onFetch, onError }) {
+  constructor ({ id, name, options, interval, held = new Set(), fetch, onFetch, onError }) {
     this.id = id
     this.name = name
     this.options = options
@@ -16,7 +16,10 @@ class Worker {
     this.onFetch = onFetch
     this.onError = onError
     this.interval = interval
-    this.jobs = []
+    // jobs fetched by this worker whose complete/fail write hasn't settled yet, including teamRefill jobs still running after onFetch returned
+    this.held = held
+    this.fetchPromise = null
+    this.abandonError = null
     this.createdOn = Date.now()
     this.lastFetchedOn = null
     this.lastJobStartedOn = null
@@ -28,6 +31,33 @@ class Worker {
     this.stopped = false
     this.loopDelayPromise = null
     this.beenNotified = false
+  }
+
+  get jobs () {
+    return Array.from(this.held, ({ job }) => job)
+  }
+
+  isBusy () {
+    return this.fetchPromise !== null || this.held.size > 0
+  }
+
+  abandon (error) {
+    this.abandonError = error
+  }
+
+  take () {
+    const entries = Array.from(this.held)
+    this.held.clear()
+    return entries
+  }
+
+  // entries whose handler or write settled meanwhile stay released, or the worker would look busy forever
+  restore (entries) {
+    for (const entry of entries) {
+      if (!entry.settled) {
+        this.held.add(entry)
+      }
+    }
   }
 
   notify () {
@@ -46,20 +76,24 @@ class Worker {
 
       try {
         this.beenNotified = false
-        const jobs = await this.fetch()
+        this.fetchPromise = this.fetch()
+
+        let jobs
+
+        try {
+          jobs = await this.fetchPromise
+        } finally {
+          this.fetchPromise = null
+        }
 
         this.lastFetchedOn = Date.now()
 
         if (jobs) {
-          this.jobs = jobs
-
           this.lastJobStartedOn = this.lastFetchedOn
 
           await this.onFetch(jobs)
 
           this.lastJobEndedOn = Date.now()
-
-          this.jobs = []
         }
       } catch (err) {
         this.lastErrorOn = Date.now()

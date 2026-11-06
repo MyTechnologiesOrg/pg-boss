@@ -13,6 +13,7 @@ const states = {
 const DEFAULT_SCHEMA = 'pgboss'
 const COMPLETION_JOB_PREFIX = `__state__${states.completed}__`
 const SINGLETON_QUEUE_KEY = '__pgboss__singleton_queue'
+const ATTEMPT_COLUMN = '__pgboss_attempt'
 const SINGLETON_QUEUE_KEY_ESCAPED = SINGLETON_QUEUE_KEY.replace(/[\\%_]/g, '\\$&')
 
 const MIGRATE_RACE_MESSAGE = 'division by zero'
@@ -57,6 +58,7 @@ module.exports = {
   states: { ...states },
   COMPLETION_JOB_PREFIX,
   SINGLETON_QUEUE_KEY,
+  ATTEMPT_COLUMN,
   MIGRATE_RACE_MESSAGE,
   CREATE_RACE_MESSAGE,
   DEFAULT_SCHEMA
@@ -350,8 +352,14 @@ function insertVersion (schema, version) {
   return `INSERT INTO ${schema}.version(version) VALUES ('${version}')`
 }
 
+// startedOn is set to now() on every fetch, so it identifies the attempt; microseconds keep JS Date precision out of it
+const attemptOf = alias => `(EXTRACT(epoch FROM ${alias}startedOn) * 1000000)::bigint`
+
+const attemptGuard = (alias = '') => `${alias}state = '${states.active}'
+        AND (${alias}id, ${attemptOf(alias)}) IN (SELECT * FROM UNNEST($1::uuid[], $3::bigint[]))`
+
 function fetchNextJob (schema) {
-  return (includeMetadata, enforceSingletonQueueActiveLimit) => `
+  return (includeMetadata, enforceSingletonQueueActiveLimit, withAttempt = false) => `
     WITH nextJob as (
       SELECT id
       FROM ${schema}.job j
@@ -386,7 +394,7 @@ function fetchNextJob (schema) {
       retryCount = CASE WHEN state = '${states.retry}' THEN retryCount + 1 ELSE retryCount END
     FROM nextJob
     WHERE j.id = nextJob.id
-    RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds
+    RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds${withAttempt ? `, ${attemptOf('j.')}::text as ${ATTEMPT_COLUMN}` : ''}
   `
 }
 
@@ -424,7 +432,7 @@ const retryStartAfterCase = `CASE
 
 const keepUntilInheritance = 'keepUntil + (keepUntil - startAfter)'
 
-function completeJobs (schema) {
+function completeJobs (schema, guarded = false) {
   return `
     WITH results AS (
       UPDATE ${schema}.job
@@ -432,7 +440,7 @@ function completeJobs (schema) {
         state = '${states.completed}',
         output = $2::jsonb
       WHERE id IN (SELECT UNNEST($1::uuid[]))
-        AND state = '${states.active}'
+        AND ${guarded ? attemptGuard() : `state = '${states.active}'`}
       RETURNING *
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)
@@ -481,9 +489,9 @@ function retryCandidates (schema, where) {
     )`
 }
 
-function failJobs (schema) {
+function failJobs (schema, guarded = false) {
   const where = `id IN (SELECT UNNEST($1::uuid[]))
-        AND state < '${states.completed}'`
+        AND ${guarded ? attemptGuard() : `state < '${states.completed}'`}`
 
   return `
     WITH ${retryCandidates(schema, where)}, results AS (
@@ -500,6 +508,7 @@ function failJobs (schema) {
       FROM candidates c
       WHERE j.id = c.id
         AND j.state < '${states.completed}'
+        ${guarded ? `AND ${attemptGuard('j.')}` : ''}
       RETURNING j.*
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)

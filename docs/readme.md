@@ -240,7 +240,7 @@ Emitted at most once every 2 seconds when workers are active and jobs are enteri
 
 ## `stopped`
 
-Emitted after `stop()` once all workers have completed their work and maintenance has been shut down.
+Emitted after `stop()` once all workers have completed their work and maintenance has been shut down. A graceful stop counts a job a worker fetched as in progress from the moment the worker's fetch query starts until its `complete()`/`fail()` write has settled, including `teamRefill` jobs still running after the worker has topped up its team.
 
 # Static functions
 
@@ -438,7 +438,9 @@ One example of how this is useful would be including `start()` inside the bootst
 
 All job monitoring will be stopped and all workers on this instance will be removed. Basically, it's the opposite of `start()`. Even though `start()` may create new database objects during initialization, `stop()` will never remove anything from the database.
 
-By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event.
+By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs before closing the internal connection pool and stopping maintenance operations. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is set.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
+
+Calling `stop()` again while a stop is running does not start another one, and its options are ignored. With `wait: true` it resolves or rejects with the running stop; otherwise it resolves immediately.
 
 **Arguments**
 
@@ -454,6 +456,14 @@ By default, calling `stop()` without any arguments will gracefully wait for all 
   * `timeout`, int
 
     Default: 30000. Maximum time (in milliseconds) to wait for workers to finish job processing before shutting down the PgBoss instance.
+
+  * `wait`, bool
+
+    Default: `false`. If `true`, the promise returned by `stop()` resolves once the stop has fully finished (after the `stopped` event), and rejects if the stop fails instead of emitting an `error` event. If the stop fails before shutting down (for example maintenance shutdown or the `failActive` write fails), the instance is not marked stopped, the connection pool is left open, and `stop()` can be called again. A `stopped` listener that throws also rejects the promise, but the stop has already completed by then.
+
+  * `failActive`, bool
+
+    Default: `false`. If `true`, jobs this instance still holds when the stop gives up waiting (at `timeout`, or immediately when `graceful` is `false`) are failed before the connection pool is closed, so they are retried according to their retry options instead of staying `active` until `expireIn` passes. Fetches still in flight at that point are given up to 5 seconds to return, and the jobs they return are failed without running their handler; a fetch that returns later still fails its jobs if the database is reachable, otherwise they expire as usual. Team jobs still waiting for `teamConcurrency` are not started. Handlers already running are not cancelled, but their later results are not written. Jobs of the internal maintenance queues held by this instance are failed too.
 
 
 ## `send()`
@@ -856,6 +866,10 @@ How often workers will poll the queue table for jobs. Available in the construct
 `handler` should either be an `async` function or return a promise. If an error occurs in the handler, it will be caught and stored into an output storage column in addition to marking the job as failed. Only the `name`, `message`, `stack`, `code` and `cause` (recursively, with the same fields) of an `Error` are stored. Other properties are dropped, since errors from libraries such as HTTP clients often carry request configuration including credentials. To store additional failure details, reject with a plain object instead of an `Error`.
 
 Enforcing promise-returning handlers that are awaited in the workers defers polling for new jobs until the existing jobs are completed, providing backpressure.
+
+A handler that throws synchronously fails its job the same way as a rejected promise, in every mode including `teamSize` and `batchSize`.
+
+A worker only completes or fails the attempt it fetched. If a job expires while its handler is still running and is retried and fetched again, the first handler's late result is ignored rather than recorded against the newer attempt.
 
 The job object has the following properties.
 

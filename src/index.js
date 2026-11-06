@@ -117,7 +117,11 @@ class PgBoss extends EventEmitter {
   }
 
   async stop (options = {}) {
-    if (this.stoppingOn) {
+    if (this.stopPromise) {
+      if (options.wait) {
+        await waitFor(this.stopPromise)
+      }
+
       return
     }
 
@@ -125,56 +129,101 @@ class PgBoss extends EventEmitter {
       this.emit(events.stopped)
     }
 
-    let { destroy = false, graceful = true, timeout = 30000 } = options
+    let { destroy = false, graceful = true, timeout = 30000, wait = false, failActive = false } = options
 
     timeout = Math.max(timeout, 1000)
 
     this.stoppingOn = Date.now()
 
-    await this.manager.stop()
-    await this.timekeeper.stop()
+    const begin = (async () => {
+      await this.manager.stop()
+      await this.timekeeper.stop()
+    })()
 
-    const shutdown = async () => {
-      this.stopped = true
-      this.stoppingOn = null
+    const finish = async () => {
+      await begin
+
+      if (graceful) {
+        await this.drain(timeout)
+      }
+
+      // before failHeld, so a failed failActive write doesn't leave maintenance workers running and abandoned
+      await this.boss.stop()
+
+      if (failActive) {
+        await this.manager.failHeld(new Error('pg-boss stopped before the job finished'))
+      }
 
       if (this.db.isOurs && this.db.opened && destroy) {
         await this.db.close()
       }
 
-      this.emit(events.stopped)
+      this.stopped = true
+      this.stoppingOn = null
     }
 
-    if (!graceful) {
-      await this.boss.stop()
-      await shutdown()
+    // never rejects, so a stop nobody waits on can't become an unhandled rejection
+    const stopPromise = this.stopPromise = (async () => {
+      try {
+        await finish()
+      } catch (err) {
+        this.stoppingOn = null
+        this.stopPromise = null
+        return err
+      }
+
+      // cleared before emitting so a stop() called from a stopped listener starts a new stop rather than joining this one
+      this.stopPromise = null
+
+      try {
+        this.emit(events.stopped)
+      } catch (err) {
+        return err
+      }
+
+      return null
+    })()
+
+    if (wait || !graceful) {
+      await waitFor(stopPromise)
       return
     }
 
+    await begin
+
     setImmediate(async () => {
-      let closing = false
+      const err = await stopPromise
 
-      try {
-        while (Date.now() - this.stoppingOn < timeout) {
-          if (this.manager.getWipData({ includeInternal: closing }).length === 0) {
-            if (closing) {
-              break
-            }
-
-            closing = true
-
-            await this.boss.stop()
-          }
-
-          await delay(1000)
-        }
-
-        await this.boss.stop()
-        await shutdown()
-      } catch (err) {
+      if (err) {
         this.emit(events.error, err)
       }
     })
+  }
+
+  async drain (timeout) {
+    let closing = false
+
+    while (Date.now() - this.stoppingOn < timeout) {
+      if (!this.manager.isBusy({ includeInternal: closing })) {
+        if (closing) {
+          return
+        }
+
+        closing = true
+
+        await this.boss.stop()
+      }
+
+      await delay(1000)
+    }
+  }
+}
+
+async function waitFor (stopPromise) {
+  const err = await stopPromise
+
+  if (err) {
+    throw err
   }
 }
 
