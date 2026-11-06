@@ -166,6 +166,29 @@ describe('graceful stop', function () {
     await boss.db.close()
   })
 
+  it('should start a new stop when stop() is called after a stop fails', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+
+    const supervisorStop = boss.boss.stop.bind(boss.boss)
+    let failures = 0
+
+    boss.boss.stop = async () => {
+      if (failures++ === 0) {
+        throw new Error('supervisor stop failed')
+      }
+
+      return await supervisorStop()
+    }
+
+    await assert.rejects(boss.stop({ graceful: false }), { message: 'supervisor stop failed' })
+
+    assert.strictEqual(boss.stopped, false)
+
+    await boss.stop({ graceful: false })
+
+    assert(boss.stopped)
+  })
+
   it('should let a later stop() with wait: true wait for the running stop', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema

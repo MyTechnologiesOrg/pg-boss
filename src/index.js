@@ -208,7 +208,13 @@ class PgBoss extends EventEmitter {
 
     const workersStopped = stopWorkers()
 
-    stop.promise = workersStopped.then(finish)
+    stop.promise = workersStopped.then(finish).finally(() => {
+      // A stop that failed before it finished is no longer running, so the next stop() starts a new one
+      if (this.currentStop === stop) {
+        this.currentStop = null
+        this.stoppingOn = null
+      }
+    })
     // A failed stop rejects every call that waits for it, and is emitted as an error only if none does
     stop.promise.catch(() => {})
 
