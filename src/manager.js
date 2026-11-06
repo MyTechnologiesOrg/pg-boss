@@ -652,12 +652,36 @@ class Manager extends EventEmitter {
     jobs.push(...workers.flatMap(worker => worker.release()))
 
     try {
-      if (jobs.length > 0) {
-        await this.failAttempts(jobs, new Error('pg-boss stopped before the job finished'))
-      }
+      await this.failReleasedJobs(jobs)
     } finally {
       // release() left the results being recorded, and those writes must land before the pool closes
       await Promise.all(workers.map(worker => worker.recorded()))
+    }
+  }
+
+  // One job can fail the whole statement, such as a singleton queue job whose retry collides with
+  // a queued job, so after a failed write for all of them each job is failed on its own
+  async failReleasedJobs (jobs) {
+    if (jobs.length === 0) {
+      return
+    }
+
+    const error = new Error('pg-boss stopped before the job finished')
+
+    try {
+      await this.failAttempts(jobs, error)
+      return
+    } catch (err) {
+      if (jobs.length === 1) {
+        throw err
+      }
+    }
+
+    const results = await Promise.allSettled(jobs.map(job => this.failAttempts([job], error)))
+    const failure = results.find(result => result.status === 'rejected')
+
+    if (failure) {
+      throw failure.reason
     }
   }
 

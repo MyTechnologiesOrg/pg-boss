@@ -605,6 +605,45 @@ describe('graceful stop', function () {
     })
   }
 
+  it('should fail the other jobs when failing one of them fails and failActive is true', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const schema = this.test.bossConfig.schema
+    const singletonQueue = `${schema}-singleton`
+    const otherQueue = `${schema}-other`
+
+    const singletonId = await boss.send(singletonQueue, null, { singletonKey: 'key', useSingletonQueue: true, retryLimit: 1, retryDelay: 60 })
+    const otherId = await boss.send(otherQueue, null, { retryLimit: 1, retryDelay: 60 })
+
+    let started = 0
+    let release
+    const released = new Promise(resolve => { release = resolve })
+
+    const handler = async () => {
+      started++
+      await released
+    }
+
+    await boss.work(singletonQueue, { newJobCheckInterval: 100 }, handler)
+    await boss.work(otherQueue, { newJobCheckInterval: 100 }, handler)
+
+    await waitFor(() => started === 2)
+
+    const queuedId = await boss.send(singletonQueue, null, { singletonKey: 'key', useSingletonQueue: true })
+
+    // Past its retention, the queued job no longer stands in for the active job's retry but still holds
+    // the key, so failing the active job throws a unique violation (see useSingletonQueue)
+    const db = await helper.getDb()
+    await db.executeSql(`UPDATE ${schema}.job SET keepUntil = now() - interval '1 second' WHERE id = $1`, [queuedId])
+    await db.close()
+
+    await assert.rejects(boss.stop({ graceful: false, failActive: true }), { constraint: 'job_singleton_queue' })
+
+    assert.strictEqual((await helper.getJobById(schema, otherId)).state, 'retry')
+    assert.strictEqual((await helper.getJobById(schema, singletonId)).state, 'active')
+
+    release()
+  })
+
   it('should finish the stop before reporting a failActive error', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
