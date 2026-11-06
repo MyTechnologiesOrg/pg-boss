@@ -51,6 +51,13 @@ describe('graceful stop', function () {
     return rows.map(job => job.state)
   }
 
+  // As if the job expired and is ready to be fetched again, while its first handler keeps running
+  const expireAttempt = async (schema, jobId) => {
+    const db = await helper.getDb()
+    await db.executeSql(`UPDATE ${schema}.job SET state = 'retry', startAfter = now() - interval '1 second' WHERE id = $1`, [jobId])
+    await db.close()
+  }
+
   const failFailActiveWrites = (boss) => {
     const executeSql = boss.db.executeSql.bind(boss.db)
 
@@ -186,7 +193,7 @@ describe('graceful stop', function () {
     assert(stoppedEmitted)
   })
 
-  it('should let a later stop() end the wait of a running stop and fail its jobs', async function () {
+  it('should let a later stop() end the wait of a running stop, fail its jobs and close the pool', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
     const schema = this.test.bossConfig.schema
@@ -204,10 +211,12 @@ describe('graceful stop', function () {
     await waitFor(() => started)
 
     await boss.stop({ timeout: 30000 })
-    await boss.stop({ graceful: false, failActive: true })
+    await boss.stop({ graceful: false, failActive: true, destroy: true })
 
     assert(boss.stopped)
+    assert.strictEqual(boss.db.opened, false)
 
+    // Failed before the pool closed, or the write would have been dropped
     const job = await helper.getJobById(schema, jobId)
 
     assert.strictEqual(job.state, 'retry')
@@ -275,6 +284,67 @@ describe('graceful stop', function () {
 
     assert.strictEqual(started, 1)
     assert.deepStrictEqual(await getStates(this.test.bossConfig.schema, queue), ['retry', 'retry', 'retry'])
+  })
+
+  it('should fail the jobs of a teamRefill worker when failActive is true', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    await boss.send(queue, null, { retryLimit: 1, retryDelay: 60 })
+    await boss.send(queue, null, { retryLimit: 1, retryDelay: 60 })
+
+    let started = 0
+    let release
+    const released = new Promise(resolve => { release = resolve })
+
+    await boss.work(queue, { teamSize: 2, teamConcurrency: 1, teamRefill: true, newJobCheckInterval: 100 }, async () => {
+      started++
+      await released
+    })
+
+    await waitFor(() => started === 1)
+
+    await boss.stop({ graceful: false, failActive: true })
+
+    assert.deepStrictEqual(await getStates(schema, queue), ['retry', 'retry'])
+
+    release()
+    await delay(500)
+
+    assert.strictEqual(started, 1)
+    assert.deepStrictEqual(await getStates(schema, queue), ['retry', 'retry'])
+  })
+
+  it('should fail the jobs of an onComplete() worker when failActive is true', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    await boss.send(queue, null, { onComplete: true })
+
+    const job = await boss.fetch(queue)
+
+    await boss.complete(job.id)
+
+    let release
+    let started = false
+
+    await boss.onComplete(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    await boss.stop({ graceful: false, failActive: true })
+
+    const { rows: [completionJob] } = await helper.findJobs(schema, 'name = $1', [helper.COMPLETION_JOB_PREFIX + queue])
+
+    assert.strictEqual(completionJob.state, 'failed')
+    assert.strictEqual(completionJob.output.message, 'pg-boss stopped before the job finished')
+
+    release()
   })
 
   it('should fail a batch still running at the timeout when failActive is true', async function () {
@@ -459,7 +529,7 @@ describe('graceful stop', function () {
     release()
   })
 
-  it('should leave a newer attempt of the job alone', async function () {
+  it('should leave a newer attempt of the job alone when failActive is true', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
     const schema = this.test.bossConfig.schema
@@ -476,10 +546,7 @@ describe('graceful stop', function () {
 
     await waitFor(() => started)
 
-    // As if the job expired and another worker fetched it again while this handler kept running
-    const db = await helper.getDb()
-    await db.executeSql(`UPDATE ${schema}.job SET state = 'retry', startAfter = now() - interval '1 second' WHERE id = $1`, [jobId])
-    await db.close()
+    await expireAttempt(schema, jobId)
 
     const newerAttempt = await boss.fetch(queue)
 
@@ -487,18 +554,52 @@ describe('graceful stop', function () {
 
     await boss.stop({ graceful: false, failActive: true })
 
-    const afterStop = await helper.getJobById(schema, jobId)
+    const job = await helper.getJobById(schema, jobId)
 
-    assert.strictEqual(afterStop.state, 'active')
-    assert.strictEqual(afterStop.retrycount, 1)
+    assert.strictEqual(job.state, 'active')
+    assert.strictEqual(job.retrycount, 1)
 
     release()
-    await delay(500)
-
-    const afterHandler = await helper.getJobById(schema, jobId)
-
-    assert.strictEqual(afterHandler.state, 'active')
   })
+
+  for (const outcome of ['resolves', 'throws']) {
+    it(`should leave a newer attempt of the job alone when the earlier handler ${outcome}`, async function () {
+      const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+      const queue = this.test.bossConfig.schema
+      const schema = this.test.bossConfig.schema
+
+      const jobId = await boss.send(queue)
+
+      let settle
+      let started = false
+
+      await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+        started = true
+        return new Promise((resolve, reject) => {
+          settle = outcome === 'resolves' ? () => resolve('late result') : () => reject(new Error('late failure'))
+        })
+      })
+
+      await waitFor(() => started)
+
+      await expireAttempt(schema, jobId)
+
+      const newerAttempt = await boss.fetch(queue)
+
+      assert.strictEqual(newerAttempt.id, jobId)
+
+      settle()
+
+      // The worker lets go of the job once its write has run
+      await waitFor(() => boss.manager.getWipData().length === 0)
+
+      const job = await helper.getJobById(schema, jobId)
+
+      assert.strictEqual(job.state, 'active')
+      assert.strictEqual(job.retrycount, 1)
+      assert.strictEqual(job.output, null)
+    })
+  }
 
   it('should record the results of a batch whose handler replaces its jobs', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
