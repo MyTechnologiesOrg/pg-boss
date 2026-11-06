@@ -243,7 +243,6 @@ class Manager extends EventEmitter {
     const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit, [TRACK_ATTEMPT]: true })
 
     const onFetch = async (jobs) => {
-      // A job stays on the worker until its result is recorded, so stop() waits for that write too
       try {
         if (this.config.__test__throw_worker) {
           throw new Error('__test__throw_worker')
