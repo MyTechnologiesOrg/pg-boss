@@ -224,6 +224,37 @@ describe('graceful stop', function () {
     release()
   })
 
+  it('should stop at the deadline of a later stop() that joins while the supervisor is stopping', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+
+    const supervisorStop = boss.boss.stop.bind(boss.boss)
+
+    let open
+    let reach
+    const opened = new Promise(resolve => { open = resolve })
+    const reached = new Promise(resolve => { reach = resolve })
+
+    boss.boss.stop = async () => {
+      reach()
+      await opened
+      return await supervisorStop()
+    }
+
+    await boss.stop({ timeout: 30000 })
+    await reached
+
+    const joined = boss.stop({ graceful: false })
+
+    open()
+
+    const openedOn = Date.now()
+
+    await joined
+
+    assert(Date.now() - openedOn < 500, `stopped ${Date.now() - openedOn}ms after the supervisor stopped`)
+    assert(boss.stopped)
+  })
+
   it('should fail jobs still running at the timeout when failActive is true', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema

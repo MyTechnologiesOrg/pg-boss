@@ -169,7 +169,8 @@ class PgBoss extends EventEmitter {
           await this.boss.stop()
         }
 
-        stop.sleep = delay(1000)
+        // Capped at the deadline, which a stop() that joins while this.boss.stop() runs may have moved
+        stop.sleep = delay(Math.max(0, Math.min(1000, stop.deadline - Date.now())))
         await stop.sleep
         stop.sleep = null
       }
