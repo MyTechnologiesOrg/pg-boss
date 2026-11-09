@@ -300,6 +300,8 @@ class Manager extends EventEmitter {
 
             if (refill) {
               onRefill()
+              // onFetch has usually returned by now, so its last wip event still counts this job
+              this.emitWip(name)
             }
           }
         }

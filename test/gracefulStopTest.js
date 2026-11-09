@@ -110,6 +110,28 @@ describe('graceful stop', function () {
     assert.deepStrictEqual(rows.map(job => job.state), ['completed', 'completed'])
   })
 
+  it('should emit a wip event without the job once a teamRefill job finishes', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    const wipEvents = []
+
+    boss.on('wip', data => wipEvents.push(data))
+
+    await boss.work(queue, { teamSize: 2, teamRefill: true, newJobCheckInterval: 100 }, () => delay(200))
+
+    await waitFor(async () => (await getStates(this.test.bossConfig.schema, queue)).join() === 'completed')
+    await waitFor(() => boss.manager.getWipData().length === 0)
+
+    // wip events are debounced for up to 2s
+    await delay(2500)
+
+    assert.strictEqual(wipEvents[0][0].count, 1)
+    assert.deepStrictEqual(wipEvents[wipEvents.length - 1], [])
+  })
+
   it('should keep a teamRefill worker until its jobs finish after offWork()', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
