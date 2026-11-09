@@ -823,6 +823,38 @@ describe('graceful stop', function () {
     assert.strictEqual(job.output, null)
   })
 
+  it('should start again after a stop whose failActive writes fail', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    await boss.send(queue)
+
+    let release
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise(resolve => { release = resolve })
+    })
+
+    await waitFor(() => started)
+
+    failFailActiveWrites(boss)
+
+    await assert.rejects(boss.stop({ graceful: false, failActive: true }), { message: 'fail write failed' })
+
+    await boss.start()
+
+    const jobId = await boss.send(queue)
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, async () => {})
+
+    await waitFor(async () => (await helper.getJobById(schema, jobId)).state === 'completed')
+
+    release()
+  })
+
   it('should emit a failActive error once from a graceful stop() without wait', async function () {
     const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
     const queue = this.test.bossConfig.schema
