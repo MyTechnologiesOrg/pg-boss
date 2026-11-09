@@ -677,11 +677,19 @@ class Manager extends EventEmitter {
       }
     }
 
-    const results = await Promise.allSettled(jobs.map(job => this.failAttempts([job], error)))
-    const failure = results.find(result => result.status === 'rejected')
+    // One at a time: two same-key singleton queue jobs failed at once would both try to retry
+    let firstError = null
 
-    if (failure) {
-      throw failure.reason
+    for (const job of jobs) {
+      try {
+        await this.failAttempts([job], error)
+      } catch (err) {
+        firstError = firstError || err
+      }
+    }
+
+    if (firstError) {
+      throw firstError
     }
   }
 

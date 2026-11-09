@@ -48,6 +48,14 @@ describe('graceful stop', function () {
     return { reached, open }
   }
 
+  // Past its retention, a queued singleton queue job no longer stands in for an active job's retry but
+  // still holds the key, so failing the active job throws a unique violation (see useSingletonQueue)
+  const pastRetention = async (schema, jobId) => {
+    const db = await helper.getDb()
+    await db.executeSql(`UPDATE ${schema}.job SET keepUntil = now() - interval '1 second' WHERE id = $1`, [jobId])
+    await db.close()
+  }
+
   const getStates = async (schema, queue) => {
     const { rows } = await helper.findJobs(schema, 'name = $1', [queue])
     return rows.map(job => job.state)
@@ -656,18 +664,80 @@ describe('graceful stop', function () {
 
     await waitFor(() => started === 2)
 
-    const queuedId = await boss.send(singletonQueue, null, { singletonKey: 'key', useSingletonQueue: true })
-
-    // Past its retention, the queued job no longer stands in for the active job's retry but still holds
-    // the key, so failing the active job throws a unique violation (see useSingletonQueue)
-    const db = await helper.getDb()
-    await db.executeSql(`UPDATE ${schema}.job SET keepUntil = now() - interval '1 second' WHERE id = $1`, [queuedId])
-    await db.close()
+    await pastRetention(schema, await boss.send(singletonQueue, null, { singletonKey: 'key', useSingletonQueue: true }))
 
     await assert.rejects(boss.stop({ graceful: false, failActive: true }), { constraint: 'job_singleton_queue' })
 
     assert.strictEqual((await helper.getJobById(schema, otherId)).state, 'retry')
     assert.strictEqual((await helper.getJobById(schema, singletonId)).state, 'active')
+
+    release()
+  })
+
+  it('should fail same-key singleton queue jobs one at a time when failing another job fails', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const schema = this.test.bossConfig.schema
+    const collidingQueue = `${schema}-colliding`
+    const pairQueue = `${schema}-pair`
+    const singletonOptions = { useSingletonQueue: true, retryLimit: 1, retryDelay: 60 }
+
+    const collidingId = await boss.send(collidingQueue, null, { ...singletonOptions, singletonKey: 'colliding' })
+
+    let started = 0
+    let release
+    const released = new Promise(resolve => { release = resolve })
+
+    const handler = async () => {
+      started++
+      await released
+    }
+
+    await boss.work(collidingQueue, { newJobCheckInterval: 100 }, handler)
+    await boss.work(pairQueue, { newJobCheckInterval: 100 }, handler)
+    await boss.work(pairQueue, { newJobCheckInterval: 100 }, handler)
+
+    // A singleton queue holds one queued job per key, so the second job is sent once the first is active
+    const pairIds = [await boss.send(pairQueue, null, { ...singletonOptions, singletonKey: 'pair' })]
+    await waitFor(() => started === 2)
+    pairIds.push(await boss.send(pairQueue, null, { ...singletonOptions, singletonKey: 'pair' }))
+    await waitFor(() => started === 3)
+
+    await pastRetention(schema, await boss.send(collidingQueue, null, { ...singletonOptions, singletonKey: 'colliding' }))
+
+    // Each fail write is held briefly, so writes made at the same time would overlap
+    const executeSql = boss.db.executeSql.bind(boss.db)
+    let writing = 0
+    let mostWriting = 0
+
+    boss.db.executeSql = async (text, values) => {
+      if (text !== boss.manager.failActiveAttemptsCommand) {
+        return await executeSql(text, values)
+      }
+
+      writing++
+      mostWriting = Math.max(mostWriting, writing)
+
+      try {
+        await delay(50)
+        return await executeSql(text, values)
+      } finally {
+        writing--
+      }
+    }
+
+    await assert.rejects(boss.stop({ graceful: false, failActive: true }), err => {
+      assert.strictEqual(err.constraint, 'job_singleton_queue')
+      assert(err.detail.includes(collidingQueue), err.detail)
+      return true
+    })
+
+    assert.strictEqual(mostWriting, 1)
+    assert.strictEqual((await helper.getJobById(schema, collidingId)).state, 'active')
+
+    // As in a single statement, one job retries and the other ends failed, since its retry would collide
+    const pairStates = await Promise.all(pairIds.map(async id => (await helper.getJobById(schema, id)).state))
+
+    assert.deepStrictEqual(pairStates.sort(), ['failed', 'retry'])
 
     release()
   })
