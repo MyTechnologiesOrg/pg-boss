@@ -173,7 +173,7 @@ Ideally, code similar to the following example would be used after creating your
 boss.on('error', error => logger.error(error));
 ```
 
-> **Note: Since error events are only raised during internal housekeeping activities, they are not raised for direct API calls.**
+> **Note: Error events are raised by internal housekeeping activities and workers, not for direct API calls. The one exception is `stop()`: a stop that fails while no `stop()` call waits for it emits its error here (see [`stop()`](#stopoptions)).**
 
 ## `monitor-states`
 
@@ -218,6 +218,8 @@ The payload of the event is an object with a key per queue and state, such as th
 ## `wip`
 
 Emitted at most once every 2 seconds when workers are active and jobs are entering or leaving active state. The payload is an array that represents each worker in this instance of pg-boss.  If you want to monitor queue activity across all instances, use `monitor-states`.
+
+A worker's `count` is the number of jobs it holds: jobs it has fetched whose result hasn't been recorded yet. For a team, it drops as each job finishes rather than when the whole team does.
 
 ```js
 [
@@ -440,7 +442,7 @@ All job monitoring will be stopped and all workers on this instance will be remo
 
 By default, calling `stop()` without any arguments will gracefully wait for all workers to finish processing active jobs, including the jobs a fetch still in progress returns, before closing the internal connection pool and stopping maintenance operations. A job counts as finished once pg-boss has tried to record its result. This behaviour can be configured using the stop options object. In graceful stop mode, the promise returned by `stop()` will still be resolved immediately unless `wait` is `true`.  If monitoring for the end of the stop is needed, add a listener to the `stopped` event or pass `wait: true`.
 
-Calling `stop()` while a stop is in progress doesn't start a second one. The call joins the running stop, which then stops waiting at the earlier of the two deadlines (straight away if the later call has `graceful: false`). The running stop also closes the pool or fails active jobs if the later call asks for it and the stop hasn't passed that step yet. Like a first call, the later call resolves once the stop has finished if it has `wait: true` or `graceful: false`, and straight away otherwise. A stop that has failed is no longer in progress, so the next `stop()` starts a new one.
+Calling `stop()` while a stop is in progress doesn't start a second one. The call joins the running stop, which then stops waiting at the earlier of the two deadlines (straight away if the later call has `graceful: false`). The running stop also closes the pool or fails active jobs if the later call asks for it and the stop hasn't passed that step yet. Like a first call, the later call resolves once the stop has finished if it has `wait: true` or `graceful: false`, and straight away otherwise. A stop that has failed is no longer in progress, so the next `stop()` starts a new one. Until a stop succeeds, the instance still counts as started: `start()` does nothing and `work()` rejects, so call `stop()` again before `start()`.
 
 **Arguments**
 
@@ -465,9 +467,9 @@ Calling `stop()` while a stop is in progress doesn't start a second one. The cal
 
     Default: `false`. If `true`, jobs this instance's workers still hold when `stop()` stops waiting for them (once `timeout` passes, or straight away when `graceful` is `false`) are failed before the connection pool is closed. They then retry according to their retry options instead of staying `active` until they expire. This covers the jobs of every `work()` and `onComplete()` worker on this instance, pg-boss's own maintenance and cron workers included, and the jobs a fetch still in progress returns. It doesn't cover jobs taken with `fetch()`.
 
-    Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. A job whose handler has already finished keeps the result its worker is recording, and `stop()` waits for that write before closing the pool. Handlers that are still running are not interrupted, and their results are not recorded. Team jobs still waiting for a free slot (see `teamConcurrency`) are failed too, and their handlers never start. These writes come after the wait that `timeout` limits and have no timeout of their own, so a slow database can make `stop()` take longer than `timeout`.
+    Only the attempt this instance fetched is failed: if a job has since expired and been fetched again by another worker, that newer attempt is left alone. A job whose handler has already finished keeps the result its worker is recording, and `stop()` waits for that write before closing the pool. Handlers that are still running are not interrupted, and their results are not recorded. Team jobs still waiting for a free slot (see `teamConcurrency`) are failed too, and their handlers never start. Waiting for a fetch still in progress, failing the jobs and waiting for the results being recorded all come after the wait that `timeout` limits, and none of them has a timeout of its own, so a slow database can make `stop()` take longer than `timeout`.
 
-    If failing a job fails, as it can for a singleton queue job that `fail()` would also throw for (see `useSingletonQueue`), the other jobs are still failed and the stop still finishes: `stopped` is emitted and, with `destroy`, the pool is closed. The first error is reported afterwards: every `stop()` call that waits for the stop rejects with it, and only if none does is it emitted as an `error` event. Calling `stop()` again won't fail that job, since the stop that released it has finished.
+    If failing a job fails, as it can for a singleton queue job that `fail()` would also throw for (see `useSingletonQueue`), the other jobs are still failed and the stop still finishes: `stopped` is emitted and, with `destroy`, the pool is closed. The first error is reported afterwards: every `stop()` call that waits for the stop rejects with it, and only if none does is it emitted as an `error` event, as the error itself, without the `queue` and `worker` properties of a worker's errors. Calling `stop()` again won't fail that job, since the stop that released it has finished.
 
 
 ## `send()`
