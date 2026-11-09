@@ -219,7 +219,7 @@ The payload of the event is an object with a key per queue and state, such as th
 
 Emitted at most once every 2 seconds when workers are active and jobs are entering or leaving active state. The payload is an array that represents each worker in this instance of pg-boss.  If you want to monitor queue activity across all instances, use `monitor-states`.
 
-A worker's `count` is the number of jobs it holds: jobs it has fetched whose result hasn't been recorded yet. For a team, it drops as each job finishes rather than when the whole team does.
+A worker's `count` is the number of jobs it holds: jobs it has fetched that pg-boss hasn't yet tried to record a result for. A job leaves the count once pg-boss has tried to record its result, even if that write fails or changes nothing, or when a `failActive` stop takes it (see [`stop()`](#stopoptions)). A team's `count` drops as each job finishes rather than when the whole team does. A `teamRefill` worker emits `wip` each time a job finishes, but other teams emit it only when they start and end, so their events show such a drop only if another worker emits one in between.
 
 ```js
 [
@@ -870,6 +870,8 @@ How often workers will poll the queue table for jobs. Available in the construct
 **Handler function**
 
 `handler` should either be an `async` function or return a promise. If an error occurs in the handler, it will be caught and stored into an output storage column in addition to marking the job as failed. Only the `name`, `message`, `stack`, `code` and `cause` (recursively, with the same fields) of an `Error` are stored. Other properties are dropped, since errors from libraries such as HTTP clients often carry request configuration including credentials. To store additional failure details, reject with a plain object instead of an `Error`.
+
+The worker records the handler's result or error only while the job is still in the `active` attempt it fetched. If the job has left `active` since, for example because it expired or was cancelled, or has been fetched again, nothing is recorded: the job keeps its state, `output` and retry time.
 
 Enforcing promise-returning handlers that are awaited in the workers defers polling for new jobs until the existing jobs are completed, providing backpressure.
 
