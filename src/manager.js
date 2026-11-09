@@ -661,8 +661,9 @@ class Manager extends EventEmitter {
     }
   }
 
-  // One job can fail the whole statement, such as a singleton queue job whose retry collides with
-  // a queued job, so after a failed write for all of them each job is failed on its own
+  // One job can fail the whole statement: a singleton queue job whose retry collides with a same-key
+  // queued job past its keepUntil throws a unique violation. So after a failed write for all of them,
+  // each job is failed on its own.
   async failReleasedJobs (jobs) {
     if (jobs.length === 0) {
       return
