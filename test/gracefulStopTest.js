@@ -1,5 +1,6 @@
 const assert = require('assert')
 const delay = require('delay')
+const { Client } = require('pg')
 const helper = require('./testHelper')
 const PgBoss = require('../')
 const { ATTEMPT_STARTED_ON } = require('../src/plans')
@@ -297,8 +298,15 @@ describe('graceful stop', function () {
     await waitFor(() => started)
 
     await boss.stop({ timeout: 30000 })
+    // The running stop is between its checks of the workers
+    await waitFor(() => boss.currentStop.sleep !== null)
+
+    const joinedOn = Date.now()
+
     await boss.stop({ graceful: false, failActive: true, destroy: true })
 
+    // The later stop() cuts short the sleep between the running stop's checks
+    assert(Date.now() - joinedOn < 500, `the later stop() took ${Date.now() - joinedOn}ms`)
     assert(boss.stopped)
     assert.strictEqual(boss.db.opened, false)
 
@@ -990,6 +998,102 @@ describe('graceful stop', function () {
       assert.strictEqual(job.state, 'active')
       assert.strictEqual(job.retrycount, 1)
       assert.strictEqual(job.output, null)
+    })
+  }
+
+  it('should record nothing when a handler fails after its job left active', async function () {
+    const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+    const queue = this.test.bossConfig.schema
+    const schema = this.test.bossConfig.schema
+
+    const jobId = await boss.send(queue, null, { retryLimit: 1 })
+
+    let fail
+    let started = false
+
+    await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+      started = true
+      return new Promise((resolve, reject) => { fail = () => reject(new Error('late failure')) })
+    })
+
+    await waitFor(() => started)
+
+    // As if the job expired into retry, with a retry time far enough out that the worker doesn't fetch it again
+    const db = await helper.getDb()
+    await db.executeSql(`UPDATE ${schema}.job SET state = 'retry', startAfter = now() + interval '1 hour' WHERE id = $1`, [jobId])
+    await db.close()
+
+    const expired = await helper.getJobById(schema, jobId)
+
+    fail()
+
+    await waitFor(() => boss.manager.getWipData().length === 0)
+
+    const job = await helper.getJobById(schema, jobId)
+
+    assert.strictEqual(job.state, 'retry')
+    assert.strictEqual(job.output, null)
+    assert.strictEqual(job.startafter.getTime(), expired.startafter.getTime())
+  })
+
+  const lockedChanges = {
+    'moves it to retry': { set: "state = 'retry'", state: 'retry' },
+    'fetches it again': { set: 'startedOn = now(), retryCount = retryCount + 1', state: 'active' }
+  }
+
+  for (const [change, { set, state }] of Object.entries(lockedChanges)) {
+    it(`should leave the job alone when failActive waits for its row lock while another transaction ${change}`, async function () {
+      const boss = this.test.boss = await helper.start({ ...this.test.bossConfig, ...defaults })
+      const queue = this.test.bossConfig.schema
+      const schema = this.test.bossConfig.schema
+
+      const jobId = await boss.send(queue, null, { retryLimit: 1 })
+
+      let release
+      let started = false
+
+      await boss.work(queue, { newJobCheckInterval: 100 }, () => {
+        started = true
+        return new Promise(resolve => { release = resolve })
+      })
+
+      await waitFor(() => started)
+
+      const locker = new Client(helper.getConfig())
+      const db = await helper.getDb()
+
+      let stopped
+
+      try {
+        await locker.connect()
+        await locker.query('BEGIN')
+        await locker.query(`SELECT id FROM ${schema}.job WHERE id = $1 FOR UPDATE`, [jobId])
+
+        const { rows: [{ pid }] } = await locker.query('SELECT pg_backend_pid() AS pid')
+
+        stopped = boss.stop({ graceful: false, failActive: true })
+
+        // failActive's write has read the job as active and now waits for the lock
+        await waitFor(async () => {
+          const { rows } = await db.executeSql('SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))', [pid])
+          return rows.length > 0
+        })
+
+        await locker.query(`UPDATE ${schema}.job SET ${set} WHERE id = $1`, [jobId])
+        await locker.query('COMMIT')
+      } finally {
+        await locker.end()
+        await db.close()
+      }
+
+      await stopped
+
+      const job = await helper.getJobById(schema, jobId)
+
+      assert.strictEqual(job.state, state)
+      assert.strictEqual(job.output, null)
+
+      release()
     })
   }
 
