@@ -19,7 +19,7 @@ describe('graceful stop', function () {
     }
   }
 
-  // Holds the first statement that matches until open() is called: before it runs, or with its result
+  // Holds every statement that matches until open() is called: before it runs, or with its result
   const holdStatement = (boss, matches, { before = false } = {}) => {
     const executeSql = boss.db.executeSql.bind(boss.db)
 
@@ -46,6 +46,22 @@ describe('graceful stop', function () {
     }
 
     return { reached, open }
+  }
+
+  // Counts the statements that complete or fail a worker's attempt from now on
+  const countAttemptWrites = (boss) => {
+    const executeSql = boss.db.executeSql.bind(boss.db)
+    const writes = { count: 0 }
+
+    boss.db.executeSql = async (text, values) => {
+      if (text === boss.manager.completeActiveAttemptsCommand || text === boss.manager.failActiveAttemptsCommand) {
+        writes.count++
+      }
+
+      return await executeSql(text, values)
+    }
+
+    return writes
   }
 
   // Past its retention, a queued singleton queue job no longer stands in for an active job's retry but
@@ -382,12 +398,13 @@ describe('graceful stop', function () {
     assert.strictEqual(failed.state, 'retry')
     assert.strictEqual(failed.output.message, 'pg-boss stopped before the job finished')
 
+    const writes = countAttemptWrites(boss)
+
     release()
     await delay(500)
 
-    const afterHandler = await helper.getJobById(schema, jobId)
-
-    assert.strictEqual(afterHandler.state, 'retry')
+    // The released worker doesn't try to record the handler's late result
+    assert.strictEqual(writes.count, 0)
   })
 
   it('should fail queued team jobs without starting them when failActive is true', async function () {
@@ -413,11 +430,13 @@ describe('graceful stop', function () {
 
     assert.deepStrictEqual(await getStates(this.test.bossConfig.schema, queue), ['retry', 'retry', 'retry'])
 
+    const writes = countAttemptWrites(boss)
+
     release()
     await delay(500)
 
     assert.strictEqual(started, 1)
-    assert.deepStrictEqual(await getStates(this.test.bossConfig.schema, queue), ['retry', 'retry', 'retry'])
+    assert.strictEqual(writes.count, 0)
   })
 
   it('should run the rest of a team when recording a failure fails', async function () {
@@ -539,10 +558,12 @@ describe('graceful stop', function () {
 
     assert.deepStrictEqual(await getStates(this.test.bossConfig.schema, queue), ['retry', 'retry'])
 
+    const writes = countAttemptWrites(boss)
+
     release()
     await delay(500)
 
-    assert.deepStrictEqual(await getStates(this.test.bossConfig.schema, queue), ['retry', 'retry'])
+    assert.strictEqual(writes.count, 0)
   })
 
   it('should keep the result a worker is recording when failActive is true', async function () {

@@ -83,7 +83,7 @@ class Worker {
     await new Promise(resolve => { this.jobsRemoved.push(resolve) })
   }
 
-  // Resolves once the results this worker started recording have been written
+  // Resolves once the writes this worker started have finished or failed
   async recorded () {
     while (this.settling.size > 0) {
       await this.jobRemoved()
