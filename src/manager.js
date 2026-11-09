@@ -185,7 +185,7 @@ class Manager extends EventEmitter {
         name,
         options,
         state,
-        count: jobs.length,
+        count: jobs.size,
         createdOn,
         lastFetchedOn,
         lastJobStartedOn,

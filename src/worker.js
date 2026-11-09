@@ -16,7 +16,7 @@ class Worker {
     this.onFetch = onFetch
     this.onError = onError
     this.interval = interval
-    this.jobs = []
+    this.jobs = new Set()
     this.createdOn = Date.now()
     this.lastFetchedOn = null
     this.lastJobStartedOn = null
@@ -43,7 +43,9 @@ class Worker {
       const jobs = await this.fetch()
 
       if (jobs) {
-        this.jobs = this.jobs.concat(jobs)
+        for (const job of jobs) {
+          this.jobs.add(job)
+        }
       }
 
       return jobs
@@ -60,13 +62,12 @@ class Worker {
 
   // A fetch in flight counts, since the jobs it fetches are already active
   isBusy () {
-    return this.fetchInFlight || this.jobs.length > 0
+    return this.fetchInFlight || this.jobs.size > 0
   }
 
   removeJobs (jobs) {
-    this.jobs = this.jobs.filter(job => !jobs.includes(job))
-
     for (const job of jobs) {
+      this.jobs.delete(job)
       this.settling.delete(job)
     }
 
@@ -92,7 +93,7 @@ class Worker {
 
   // Claims the jobs for recording their handler's result, unless release() has already taken them
   settle (jobs) {
-    if (!jobs.every(job => this.jobs.includes(job))) {
+    if (!jobs.every(job => this.jobs.has(job))) {
       return false
     }
 
@@ -108,7 +109,7 @@ class Worker {
   release () {
     this.released = true
 
-    const jobs = this.jobs.filter(job => !this.settling.has(job))
+    const jobs = Array.from(this.jobs).filter(job => !this.settling.has(job))
 
     this.removeJobs(jobs)
 
@@ -165,7 +166,7 @@ class Worker {
 
     // A teamRefill worker leaves the loop while jobs it fetched are still running, and a released
     // worker may still hold jobs that stop() is about to fail
-    while (this.jobs.length > 0) {
+    while (this.jobs.size > 0) {
       await this.jobRemoved()
     }
 
