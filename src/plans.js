@@ -14,6 +14,9 @@ const DEFAULT_SCHEMA = 'pgboss'
 const COMPLETION_JOB_PREFIX = `__state__${states.completed}__`
 const SINGLETON_QUEUE_KEY = '__pgboss__singleton_queue'
 const SINGLETON_QUEUE_KEY_ESCAPED = SINGLETON_QUEUE_KEY.replace(/[\\%_]/g, '\\$&')
+const ATTEMPT_STARTED_ON = 'attempt_started_on'
+// startedOn as UTC text with microseconds: a JS Date would round it to milliseconds and never match again
+const ATTEMPT_STARTED_ON_FORMAT = 'YYYY-MM-DD HH24:MI:SS.US'
 
 const MIGRATE_RACE_MESSAGE = 'division by zero'
 const CREATE_RACE_MESSAGE = 'already exists'
@@ -26,9 +29,11 @@ module.exports = {
   versionTableExists,
   fetchNextJob,
   completeJobs,
+  completeActiveAttempts,
   cancelJobs,
   resumeJobs,
   failJobs,
+  failActiveAttempts,
   insertJob,
   insertJobs,
   getTime,
@@ -57,6 +62,7 @@ module.exports = {
   states: { ...states },
   COMPLETION_JOB_PREFIX,
   SINGLETON_QUEUE_KEY,
+  ATTEMPT_STARTED_ON,
   MIGRATE_RACE_MESSAGE,
   CREATE_RACE_MESSAGE,
   DEFAULT_SCHEMA
@@ -351,7 +357,7 @@ function insertVersion (schema, version) {
 }
 
 function fetchNextJob (schema) {
-  return (includeMetadata, enforceSingletonQueueActiveLimit) => `
+  return (includeMetadata, enforceSingletonQueueActiveLimit, includeAttemptStartedOn = false) => `
     WITH nextJob as (
       SELECT id
       FROM ${schema}.job j
@@ -387,6 +393,7 @@ function fetchNextJob (schema) {
     FROM nextJob
     WHERE j.id = nextJob.id
     RETURNING ${includeMetadata ? 'j.*' : 'j.id, name, data'}, EXTRACT(epoch FROM expireIn) as expire_in_seconds
+      ${includeAttemptStartedOn ? `, to_char(j.startedOn AT TIME ZONE 'UTC', '${ATTEMPT_STARTED_ON_FORMAT}') as ${ATTEMPT_STARTED_ON}` : ''}
   `
 }
 
@@ -425,14 +432,22 @@ const retryStartAfterCase = `CASE
 const keepUntilInheritance = 'keepUntil + (keepUntil - startAfter)'
 
 function completeJobs (schema) {
+  return completeJobsWhere(schema, `id IN (SELECT UNNEST($1::uuid[]))
+        AND state = '${states.active}'`)
+}
+
+function completeActiveAttempts (schema) {
+  return completeJobsWhere(schema, activeAttemptsWhere())
+}
+
+function completeJobsWhere (schema, where) {
   return `
     WITH results AS (
       UPDATE ${schema}.job
       SET completedOn = now(),
         state = '${states.completed}',
         output = $2::jsonb
-      WHERE id IN (SELECT UNNEST($1::uuid[]))
-        AND state = '${states.active}'
+      WHERE ${where}
       RETURNING *
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)
@@ -485,6 +500,26 @@ function failJobs (schema) {
   const where = `id IN (SELECT UNNEST($1::uuid[]))
         AND state < '${states.completed}'`
 
+  return failJobsWhere(schema, where, `j.state < '${states.completed}'`)
+}
+
+function failActiveAttempts (schema) {
+  return failJobsWhere(schema, activeAttemptsWhere(), activeAttemptsWhere('j.'))
+}
+
+// Matches only the attempt a worker fetched, while it is still active. A job that has since expired
+// and been fetched again has a new startedOn, so the newer attempt is left alone.
+// $1 holds the job ids and $3 their startedOn as ATTEMPT_STARTED_ON_FORMAT.
+function activeAttemptsWhere (alias = '') {
+  return `${alias}state = '${states.active}'
+        AND (${alias}id, ${alias}startedOn) IN (
+          SELECT a.id, a.started_on::timestamp AT TIME ZONE 'UTC'
+          FROM UNNEST($1::uuid[], $3::text[]) AS a(id, started_on)
+        )`
+}
+
+// recheck is repeated on the UPDATE so a row changed while it waited for the row lock is skipped
+function failJobsWhere (schema, where, recheck) {
   return `
     WITH ${retryCandidates(schema, where)}, results AS (
       UPDATE ${schema}.job j
@@ -499,7 +534,7 @@ function failJobs (schema) {
         output = $2::jsonb
       FROM candidates c
       WHERE j.id = c.id
-        AND j.state < '${states.completed}'
+        AND ${recheck}
       RETURNING j.*
     ), completion_jobs as (
       INSERT INTO ${schema}.job (name, data, keepUntil)

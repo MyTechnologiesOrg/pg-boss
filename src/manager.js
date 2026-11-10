@@ -14,7 +14,10 @@ const { QUEUES: TIMEKEEPER_QUEUES } = require('./timekeeper')
 const INTERNAL_QUEUES = Object.values(BOSS_QUEUES).concat(Object.values(TIMEKEEPER_QUEUES)).reduce((acc, i) => ({ ...acc, [i]: i }), {})
 
 const plans = require('./plans')
-const { COMPLETION_JOB_PREFIX, SINGLETON_QUEUE_KEY } = plans
+const { COMPLETION_JOB_PREFIX, SINGLETON_QUEUE_KEY, ATTEMPT_STARTED_ON } = plans
+
+// A fetch option only workers can pass, so fetch() results keep their shape for everyone else
+const TRACK_ATTEMPT = Symbol('trackAttempt')
 
 const WIP_EVENT_INTERVAL = 2000
 const WIP_DEBOUNCE_OPTIONS = { leading: true, trailing: true, maxWait: WIP_EVENT_INTERVAL }
@@ -69,6 +72,7 @@ class Manager extends EventEmitter {
 
     this.events = events
     this.workers = new Map()
+    this.attempts = new WeakMap()
 
     this.nextJobCommand = plans.fetchNextJob(config.schema)
     this.insertJobCommand = plans.insertJob(config.schema)
@@ -77,6 +81,8 @@ class Manager extends EventEmitter {
     this.cancelJobsCommand = plans.cancelJobs(config.schema)
     this.resumeJobsCommand = plans.resumeJobs(config.schema)
     this.failJobsCommand = plans.failJobs(config.schema)
+    this.completeActiveAttemptsCommand = plans.completeActiveAttempts(config.schema)
+    this.failActiveAttemptsCommand = plans.failActiveAttempts(config.schema)
     this.getJobByIdCommand = plans.getJobById(config.schema)
     this.getArchivedJobByIdCommand = plans.getArchivedJobById(config.schema)
     this.subscribeCommand = plans.subscribe(config.schema)
@@ -179,7 +185,7 @@ class Manager extends EventEmitter {
         name,
         options,
         state,
-        count: jobs.length,
+        count: jobs.size,
         createdOn,
         lastFetchedOn,
         lastJobStartedOn,
@@ -190,6 +196,12 @@ class Manager extends EventEmitter {
       .filter(i => i.count > 0 && (!INTERNAL_QUEUES[i.name] || includeInternal))
 
     return data
+  }
+
+  hasBusyWorkers (options = {}) {
+    const { includeInternal = false } = options
+
+    return this.getWorkers().some(worker => worker.isBusy() && (!INTERNAL_QUEUES[worker.name] || includeInternal))
   }
 
   async watch (name, options, callback) {
@@ -228,33 +240,75 @@ class Manager extends EventEmitter {
       createTeamRefillPromise()
     }
 
-    const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit })
+    const fetch = () => this.fetch(name, batchSize || (teamSize - queueSize), { includeMetadata, enforceSingletonQueueActiveLimit, [TRACK_ATTEMPT]: true })
 
     const onFetch = async (jobs) => {
-      if (this.config.__test__throw_worker) {
-        throw new Error('__test__throw_worker')
-      }
+      try {
+        if (this.config.__test__throw_worker) {
+          throw new Error('__test__throw_worker')
+        }
 
-      this.emitWip(name)
+        this.emitWip(name)
+      } catch (err) {
+        worker.removeJobs(jobs)
+        throw err
+      }
 
       if (batchSize) {
         const maxExpiration = jobs.reduce((acc, i) => Math.max(acc, i.expire_in_seconds), 0)
+        // The handler gets the fetched array itself and may change it
+        const fetched = jobs.slice()
 
-        await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
-          .then(() => this.complete(jobs.map(job => job.id)))
-          .catch(err => this.fail(jobs.map(job => job.id), err))
+        try {
+          await resolveWithinSeconds(Promise.all([callback(jobs)]), maxExpiration)
+
+          if (worker.settle(fetched)) {
+            await this.completeAttempts(fetched)
+          }
+        } catch (err) {
+          if (worker.settle(fetched)) {
+            await this.failAttempts(fetched, err)
+          }
+        } finally {
+          worker.removeJobs(fetched)
+        }
       } else {
         if (refill) {
           queueSize += jobs.length || 1
         }
 
-        const allTeamPromise = pMap(jobs, job =>
-          resolveWithinSeconds(callback(job), job.expire_in_seconds)
-            .then(result => this.complete(job.id, result))
-            .catch(err => this.fail(job.id, err))
-            .then(() => refill ? onRefill() : null)
-        , { concurrency: teamConcurrency }
-        ).catch(() => {}) // allow promises & non-promises to live together in harmony
+        const processJob = async (job) => {
+          try {
+            // stop() took every job of a released worker to fail it, so this one is never started
+            if (worker.released) {
+              return
+            }
+
+            try {
+              const result = await resolveWithinSeconds(callback(job), job.expire_in_seconds)
+
+              if (worker.settle([job])) {
+                await this.completeAttempts([job], result)
+              }
+            } catch (err) {
+              if (worker.settle([job])) {
+                await this.failAttempts([job], err)
+              }
+            }
+          } finally {
+            worker.removeJobs([job])
+
+            if (refill) {
+              onRefill()
+              // onFetch has usually returned by now, so its last wip event still counts this job
+              this.emitWip(name)
+            }
+          }
+        }
+
+        // Without stopOnError: false, one rejected fail() would leave the rest of the team fetched but never run
+        const allTeamPromise = pMap(jobs, processJob, { concurrency: teamConcurrency, stopOnError: false })
+          .catch(() => {})
 
         if (refill) {
           if (queueSize < teamSize) {
@@ -494,7 +548,8 @@ class Manager extends EventEmitter {
   async fetch (name, batchSize, options = {}) {
     const values = Attorney.checkFetchArgs(name, batchSize, options)
     const db = options.db || this.db
-    const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false)
+    const trackAttempt = options[TRACK_ATTEMPT] === true
+    const preparedStatement = this.nextJobCommand(options.includeMetadata || false, options.enforceSingletonQueueActiveLimit || false, trackAttempt)
     const statementValues = [values.name, batchSize || 1]
 
     let result
@@ -507,6 +562,13 @@ class Manager extends EventEmitter {
 
     if (!result || result.rows.length === 0) {
       return null
+    }
+
+    if (trackAttempt) {
+      for (const job of result.rows) {
+        this.attempts.set(job, { id: job.id, startedOn: job[ATTEMPT_STARTED_ON] })
+        delete job[ATTEMPT_STARTED_ON]
+      }
     }
 
     return result.rows.length === 1 && !batchSize ? result.rows[0] : result.rows
@@ -560,6 +622,78 @@ class Manager extends EventEmitter {
     const ids = this.mapCompletionIdArg(id, 'fail')
     const result = await db.executeSql(this.failJobsCommand, [ids, this.mapCompletionDataArg(data)])
     return this.mapCompletionResponse(ids, result)
+  }
+
+  // Workers settle only the attempt they fetched: a handler still running after its job expired
+  // and was fetched again elsewhere must not complete or fail that newer attempt.
+  async completeAttempts (jobs, data) {
+    await this.settleAttempts(this.completeActiveAttemptsCommand, jobs, data)
+  }
+
+  async failAttempts (jobs, data) {
+    await this.settleAttempts(this.failActiveAttemptsCommand, jobs, data)
+  }
+
+  async settleAttempts (command, jobs, data) {
+    const attempts = jobs.map(job => this.attempts.get(job))
+    const ids = attempts.map(attempt => attempt.id)
+    const startedOns = attempts.map(attempt => attempt.startedOn)
+
+    await this.db.executeSql(command, [ids, this.mapCompletionDataArg(data), startedOns])
+  }
+
+  // Fails the jobs held by this instance's workers, except those whose result is already being
+  // recorded. Released workers record no later results for them and start no handlers they queued.
+  async failActiveJobs () {
+    const workers = this.getWorkers()
+    const jobs = workers.flatMap(worker => worker.release())
+
+    // A fetch still in flight leaves its jobs on its released worker
+    await Promise.all(workers.map(worker => worker.fetched()))
+
+    jobs.push(...workers.flatMap(worker => worker.release()))
+
+    try {
+      await this.failReleasedJobs(jobs)
+    } finally {
+      // release() left the results being recorded, and those writes must land before the pool closes
+      await Promise.all(workers.map(worker => worker.recorded()))
+    }
+  }
+
+  // One job can fail the whole statement: a singleton queue job whose retry collides with a same-key
+  // queued job past its keepUntil throws a unique violation. So after a failed write for all of them,
+  // each job is failed on its own.
+  async failReleasedJobs (jobs) {
+    if (jobs.length === 0) {
+      return
+    }
+
+    const error = new Error('pg-boss stopped before the job finished')
+
+    try {
+      await this.failAttempts(jobs, error)
+      return
+    } catch (err) {
+      if (jobs.length === 1) {
+        throw err
+      }
+    }
+
+    // One at a time: two same-key singleton queue jobs failed at once would both try to retry
+    let firstError = null
+
+    for (const job of jobs) {
+      try {
+        await this.failAttempts([job], error)
+      } catch (err) {
+        firstError = firstError || err
+      }
+    }
+
+    if (firstError) {
+      throw firstError
+    }
   }
 
   async cancel (id, options = {}) {

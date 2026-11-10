@@ -49,6 +49,9 @@ class Boss extends EventEmitter {
   }
 
   async supervise () {
+    // A restarted instance supervises again, so its next stop() must stop these workers again
+    this.stopped = false
+
     this.metaMonitor()
 
     await this.manager.deleteQueue(COMPLETION_JOB_PREFIX + queues.MAINTENANCE)

@@ -250,7 +250,9 @@ declare namespace PgBoss {
   interface StopOptions {
     destroy?: boolean,
     graceful?: boolean,
-    timeout?: number
+    timeout?: number,
+    wait?: boolean,
+    failActive?: boolean
   }
 
   interface OffWorkOptions {
